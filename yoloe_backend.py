@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Optional, Tuple, Union
 import os
 import cv2
 import numpy as np
+import torch
 
 # 兼容 YOLOE / YOLO
 try:
@@ -11,14 +12,28 @@ try:
 except Exception:
     from ultralytics import YOLO as _MODEL
 
-DEFAULT_MODEL_PATH = os.getenv("YOLOE_MODEL_PATH", r"C:\Users\Administrator\Desktop\rebuild1002\model\yoloe-11l-seg.pt")
+DEFAULT_MODEL_PATH = os.getenv(
+    "YOLOE_MODEL_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "model", "yoloe-11l-seg.pt"),
+)
 TRACKER_CFG        = os.getenv("YOLO_TRACKER_YAML", "bytetrack.yaml")
 
 class YoloEBackend:
     def __init__(self, model_path: Optional[str] = None, device: Optional[Union[str, int]] = None):
         self.model = _MODEL(model_path or DEFAULT_MODEL_PATH)
-        self.model.to("cuda")
-        self.device = device
+        if device is not None:
+            self.device = device
+        elif torch.cuda.is_available():
+            self.device = "cuda"
+        else:
+            self.device = "cpu"
+
+        try:
+            self.model.to(self.device)
+        except Exception:
+            if self.device != "cpu":
+                self.device = "cpu"
+                self.model.to("cpu")
 
     def set_text_classes(self, names: List[str]):
         # YOLOE 文本提示：与你模板一致

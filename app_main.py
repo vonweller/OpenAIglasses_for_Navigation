@@ -1,6 +1,6 @@
 # app_main.py
 # -*- coding: utf-8 -*-
-import os, sys, time, json, asyncio, base64, audioop
+import os, sys, time, json, asyncio, base64, audioop, socket
 from typing import Any, Dict, Optional, Tuple, List, Callable, Set, Deque
 from collections import deque
 from dataclasses import dataclass
@@ -29,6 +29,44 @@ import torch  # 添加这行
 import mediapipe as mp
 import bridge_io
 import threading
+# ---- .env ----
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_MODEL_DIR = os.path.join(APP_DIR, "model")
+DEFAULT_NAV_SEG_MODEL = os.path.join(DEFAULT_MODEL_DIR, "yolo-seg.pt")
+DEFAULT_OBSTACLE_MODEL = os.path.join(DEFAULT_MODEL_DIR, "yoloe-11l-seg.pt")
+DEFAULT_TRAFFIC_MODEL = os.path.join(DEFAULT_MODEL_DIR, "trafficlight.pt")
+DEFAULT_HAND_TASK = os.path.join(DEFAULT_MODEL_DIR, "hand_landmarker.task")
+DEFAULT_ITEM_MODEL = os.path.join(DEFAULT_MODEL_DIR, "yoloe-11l-seg.pt")
+RUNTIME_CONFIG_PATH = os.path.join(APP_DIR, "runtime_config.json")
+MODEL_CONFIG_FIELDS = {
+    "blind_path_model": ("BLIND_PATH_MODEL", DEFAULT_NAV_SEG_MODEL),
+    "obstacle_model": ("OBSTACLE_MODEL", DEFAULT_OBSTACLE_MODEL),
+    "trafficlight_model": ("TRAFFICLIGHT_MODEL", DEFAULT_TRAFFIC_MODEL),
+    "hand_task_path": ("HAND_TASK_PATH", DEFAULT_HAND_TASK),
+    "item_search_model": ("YOLOE_MODEL_PATH", DEFAULT_ITEM_MODEL),
+}
+
+def _load_runtime_config_env():
+    try:
+        with open(RUNTIME_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return
+    models = data.get("models", data) if isinstance(data, dict) else {}
+    if not isinstance(models, dict):
+        return
+    for field, (env_key, _default) in MODEL_CONFIG_FIELDS.items():
+        value = str(models.get(field) or "").strip()
+        if value and not os.getenv(env_key):
+            os.environ[env_key] = value
+
+_load_runtime_config_env()
 import yolomedia  # 确保和 app_main.py 同目录，文件名就是 yolomedia.py
 # ---- Windows 事件循环策略 ----
 if sys.platform.startswith("win"):
@@ -37,19 +75,10 @@ if sys.platform.startswith("win"):
     except Exception:
         pass
 
-# ---- .env ----
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
-
 # ---- DashScope ASR 基础 ----
 from dashscope import audio as dash_audio  # 若未安装，会在原项目里抛错提示
 
-API_KEY = os.getenv("DASHSCOPE_API_KEY", "sk-a9440db694924559ae4ebdc2023d2b9a")
-if not API_KEY:
-    raise RuntimeError("未设置 DASHSCOPE_API_KEY")
+API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 
 MODEL        = "paraformer-realtime-v2"
 SAMPLE_RATE  = 16000
@@ -121,7 +150,7 @@ def load_navigation_models():
     global yolo_seg_model, obstacle_detector
 
     try:
-        seg_model_path = os.getenv("BLIND_PATH_MODEL", r"C:\Users\Administrator\Desktop\rebuild1002\model\yolo-seg.pt")
+        seg_model_path = os.getenv("BLIND_PATH_MODEL", DEFAULT_NAV_SEG_MODEL)
         #print(f"[NAVIGATION] 尝试加载模型: {seg_model_path}")
 
         if os.path.exists(seg_model_path):
@@ -153,70 +182,10 @@ def load_navigation_models():
             print(f"[NAVIGATION] 当前工作目录: {os.getcwd()}")
             print(f"[NAVIGATION] 请检查文件路径是否正确")
             
-        # 【修改开始】使用 ObstacleDetectorClient 替代直接的 YOLO
-        obstacle_model_path = os.getenv("OBSTACLE_MODEL", r"C:\Users\Administrator\Desktop\rebuild1002\model\yoloe-11l-seg.pt")
-        print(f"[NAVIGATION] 尝试加载障碍物检测模型: {obstacle_model_path}")
-        
-        if os.path.exists(obstacle_model_path):
-            print(f"[NAVIGATION] 障碍物检测模型文件存在，开始加载...")
-            try:
-                # 使用 ObstacleDetectorClient 封装的 YOLO-E
-                obstacle_detector = ObstacleDetectorClient(model_path=obstacle_model_path)
-                print(f"[NAVIGATION] ========== YOLO-E 障碍物检测器加载成功 ==========")
-                
-                # 检查模型是否成功加载
-                if hasattr(obstacle_detector, 'model') and obstacle_detector.model is not None:
-                    print(f"[NAVIGATION] YOLO-E 模型已初始化")
-                    print(f"[NAVIGATION] 模型设备: {next(obstacle_detector.model.parameters()).device}")
-                else:
-                    print(f"[NAVIGATION] 警告：YOLO-E 模型初始化异常")
-                
-                # 检查白名单是否成功加载
-                if hasattr(obstacle_detector, 'WHITELIST_CLASSES'):
-                    print(f"[NAVIGATION] 白名单类别数: {len(obstacle_detector.WHITELIST_CLASSES)}")
-                    print(f"[NAVIGATION] 白名单前10个类别: {', '.join(obstacle_detector.WHITELIST_CLASSES[:10])}")
-                else:
-                    print(f"[NAVIGATION] 警告：白名单类别未定义")
-                
-                # 检查文本特征是否成功预计算
-                if hasattr(obstacle_detector, 'whitelist_embeddings') and obstacle_detector.whitelist_embeddings is not None:
-                    print(f"[NAVIGATION] YOLO-E 文本特征已预计算")
-                    print(f"[NAVIGATION] 文本特征张量形状: {obstacle_detector.whitelist_embeddings.shape if hasattr(obstacle_detector.whitelist_embeddings, 'shape') else '未知'}")
-                else:
-                    print(f"[NAVIGATION] 警告：YOLO-E 文本特征未预计算")
-                
-                # 测试障碍物检测功能
-                print(f"[NAVIGATION] 开始测试 YOLO-E 检测功能...")
-                try:
-                    test_img = np.zeros((640, 640, 3), dtype=np.uint8)
-                    # 在测试图像中画一个白色矩形，模拟一个物体
-                    cv2.rectangle(test_img, (200, 200), (400, 400), (255, 255, 255), -1)
-                    
-                    # 测试检测（不提供 path_mask）
-                    test_results = obstacle_detector.detect(test_img)
-                    print(f"[NAVIGATION] YOLO-E 检测测试成功!")
-                    print(f"[NAVIGATION] 测试检测结果数: {len(test_results)}")
-                    
-                    if len(test_results) > 0:
-                        print(f"[NAVIGATION] 测试检测到的物体:")
-                        for i, obj in enumerate(test_results):
-                            print(f"  - 物体 {i+1}: {obj.get('name', 'unknown')}, "
-                                  f"面积比例: {obj.get('area_ratio', 0):.3f}, "
-                                  f"位置: ({obj.get('center_x', 0):.0f}, {obj.get('center_y', 0):.0f})")
-                except Exception as e:
-                    print(f"[NAVIGATION] YOLO-E 检测测试失败: {e}")
-                    import traceback
-                    traceback.print_exc()
-                
-                print(f"[NAVIGATION] ========== YOLO-E 障碍物检测器加载完成 ==========")
-                
-            except Exception as e:
-                print(f"[NAVIGATION] 障碍物检测器加载失败: {e}")
-                import traceback
-                traceback.print_exc()
-                obstacle_detector = None
-        else:
-            print(f"[NAVIGATION] 警告：找不到障碍物检测模型文件: {obstacle_model_path}")
+        # 障碍物 YOLOE 预加载会触发较重的特征下载，默认改为启动后按需加载
+        obstacle_model_path = os.getenv("OBSTACLE_MODEL", DEFAULT_OBSTACLE_MODEL)
+        obstacle_detector = None
+        print(f"[NAVIGATION] 障碍物检测器已改为按需加载: {obstacle_model_path}")
         
     except Exception as e:
         print(f"[NAVIGATION] 模型加载失败: {e}")
@@ -705,6 +674,198 @@ def root():
 @app.get("/api/health", response_class=PlainTextResponse)
 def health():
     return "OK"
+
+@app.get("/api/device-status")
+def device_status():
+    def _ws_connected(ws: Optional[WebSocket]) -> bool:
+        try:
+            return bool(ws and ws.client_state == WebSocketState.CONNECTED)
+        except Exception:
+            return False
+
+    last_frame_age = None
+    if last_frames:
+        try:
+            last_frame_age = max(0.0, time.time() - last_frames[-1][0])
+        except Exception:
+            last_frame_age = None
+
+    return {
+        "camera_connected": _ws_connected(esp32_camera_ws),
+        "audio_connected": _ws_connected(esp32_audio_ws),
+        "viewer_count": len(camera_viewers),
+        "imu_viewer_count": len(imu_ws_clients),
+        "last_frame_age_sec": last_frame_age,
+    }
+
+def _local_ipv4s() -> List[str]:
+    ips: List[str] = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and not ip.startswith("127.") and ip not in ips:
+                ips.append(ip)
+    except Exception:
+        pass
+    if not ips:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            if ip and not ip.startswith("127.") and ip not in ips:
+                ips.append(ip)
+        except Exception:
+            pass
+    def _score(ip: str) -> int:
+        parts = ip.split(".")
+        try:
+            first = int(parts[0])
+            second = int(parts[1])
+        except Exception:
+            return 99
+        if first == 192 and second == 168:
+            return 0
+        if first == 10:
+            return 1
+        if first == 172 and 16 <= second <= 31:
+            return 2
+        if first == 169 and second == 254:
+            return 8
+        if first == 198 and second in (18, 19):
+            return 9
+        return 5
+
+    return sorted(ips, key=_score)
+
+def _mask_key(key: str) -> str:
+    if not key:
+        return ""
+    if len(key) <= 8:
+        return "*" * len(key)
+    return f"{key[:3]}***{key[-4:]}"
+
+def _persist_env_value(key: str, value: str) -> None:
+    if not key or not value:
+        return
+    env_path = os.path.join(APP_DIR, ".env")
+    lines: List[str] = []
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except Exception:
+            lines = []
+
+    updated = False
+    prefix = f"{key}="
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    new_line = f'{key}="{escaped}"'
+    for idx, line in enumerate(lines):
+        if line.strip().startswith(prefix):
+            lines[idx] = new_line
+            updated = True
+            break
+    if not updated:
+        lines.append(new_line)
+
+    try:
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines).rstrip() + "\n")
+    except Exception as exc:
+        print(f"[CONFIG] failed to persist {key} to .env: {exc}", flush=True)
+
+@app.get("/api/runtime-config")
+def runtime_config(request: Request):
+    host_header = request.headers.get("host", "127.0.0.1:8081")
+    port = host_header.split(":")[-1] if ":" in host_header else "8081"
+    local_ips = _local_ipv4s()
+    recommended_host = local_ips[0] if local_ips else host_header.split(":")[0]
+    base_host = f"{recommended_host}:{port}"
+    return {
+        "api_key_configured": bool(API_KEY),
+        "api_key_masked": _mask_key(API_KEY),
+        "http_url": f"http://{base_host}/",
+        "server_host": recommended_host,
+        "server_port": port,
+        "local_ips": local_ips,
+        "endpoints": {
+            "camera_ws": f"ws://{base_host}/ws/camera",
+            "audio_ws": f"ws://{base_host}/ws_audio",
+            "viewer_ws": f"ws://{base_host}/ws/viewer",
+            "ui_ws": f"ws://{base_host}/ws_ui",
+            "imu_ws": f"ws://{base_host}/ws",
+            "audio_stream": f"http://{base_host}/stream.wav",
+            "imu_udp": f"{recommended_host}:{UDP_PORT}",
+        },
+        "notes": {
+            "camera_ws": "ESP32 摄像头 JPEG 二进制上传",
+            "audio_ws": "ESP32 麦克风 PCM16 上传",
+            "imu_udp": "ESP32 IMU UDP JSON 发送目标",
+        },
+        "models": {
+            "blind_path_model": os.getenv("BLIND_PATH_MODEL", DEFAULT_NAV_SEG_MODEL),
+            "obstacle_model": os.getenv("OBSTACLE_MODEL", DEFAULT_OBSTACLE_MODEL),
+            "trafficlight_model": os.getenv("TRAFFICLIGHT_MODEL", DEFAULT_TRAFFIC_MODEL),
+            "hand_task_path": os.getenv("HAND_TASK_PATH", DEFAULT_HAND_TASK),
+            "item_search_model": os.getenv("YOLOE_MODEL_PATH", DEFAULT_ITEM_MODEL),
+        },
+    }
+
+@app.post("/api/runtime-config")
+async def update_runtime_config(request: Request):
+    global API_KEY
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    new_key = str(body.get("dashscope_api_key") or "").strip()
+    if new_key:
+        API_KEY = new_key
+        os.environ["DASHSCOPE_API_KEY"] = new_key
+        _persist_env_value("DASHSCOPE_API_KEY", new_key)
+        try:
+            import omni_client as _omni_client
+            if hasattr(_omni_client, "set_api_key"):
+                _omni_client.set_api_key(new_key)
+        except Exception:
+            pass
+    model_updates = {
+        "BLIND_PATH_MODEL": str(body.get("blind_path_model") or "").strip(),
+        "OBSTACLE_MODEL": str(body.get("obstacle_model") or "").strip(),
+        "TRAFFICLIGHT_MODEL": str(body.get("trafficlight_model") or "").strip(),
+        "HAND_TASK_PATH": str(body.get("hand_task_path") or "").strip(),
+        "YOLOE_MODEL_PATH": str(body.get("item_search_model") or "").strip(),
+    }
+    saved_models = {}
+    for env_key, value in model_updates.items():
+        if value:
+            os.environ[env_key] = value
+            saved_models[env_key.lower()] = value
+    if saved_models:
+        persisted_models = {}
+        try:
+            with open(RUNTIME_CONFIG_PATH, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except Exception:
+            existing = {}
+        if isinstance(existing, dict) and isinstance(existing.get("models"), dict):
+            persisted_models.update(existing["models"])
+        for field, (env_key, _default) in MODEL_CONFIG_FIELDS.items():
+            value = os.environ.get(env_key, "")
+            if value:
+                persisted_models[field] = value
+        try:
+            with open(RUNTIME_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump({"models": persisted_models}, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            print(f"[CONFIG] failed to persist runtime config: {exc}", flush=True)
+    return {
+        "ok": True,
+        "api_key_configured": bool(API_KEY),
+        "api_key_masked": _mask_key(API_KEY),
+        "saved_models": saved_models,
+    }
 
 # 注册 /stream.wav
 register_stream_route(app)

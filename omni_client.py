@@ -6,17 +6,24 @@ from typing import AsyncGenerator, Dict, Any, List, Optional, Tuple
 from openai import OpenAI
 
 # ===== OpenAI 兼容（达摩院 DashScope 兼容模式）=====
-API_KEY = os.getenv("DASHSCOPE_API_KEY", "sk-a9440db694924559ae4ebdc2023d2b9a")
-if not API_KEY:
-    raise RuntimeError("未设置 DASHSCOPE_API_KEY")
+API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 
 QWEN_MODEL = "qwen-omni-turbo"
 
 # 兼容模式
 oai_client = OpenAI(
-    api_key=API_KEY,
+    api_key=API_KEY or "missing-key",
     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
+
+def set_api_key(api_key: str):
+    global API_KEY, oai_client
+    API_KEY = (api_key or "").strip()
+    os.environ["DASHSCOPE_API_KEY"] = API_KEY
+    oai_client = OpenAI(
+        api_key=API_KEY or "missing-key",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    )
 
 class OmniStreamPiece:
     """对外的统一增量数据：text/audio 二选一或同时。"""

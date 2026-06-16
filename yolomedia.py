@@ -20,11 +20,18 @@ import math
 import cv2
 import numpy as np
 import mediapipe as mp
-from mediapipe.framework.formats import landmark_pb2
+try:
+    from mediapipe.framework.formats import landmark_pb2
+except ModuleNotFoundError:
+    landmark_pb2 = None
+    from mediapipe.tasks.python.components.containers import landmark as landmark_container
 from ultralytics import YOLO
 from ultralytics.utils.plotting import Colors
 import bridge_io
-import pygame  # 用于播放本地音频文件
+try:
+    import pygame  # 用于播放本地音频文件
+except ModuleNotFoundError:
+    pygame = None
 
 from audio_player import play_audio_threadsafe
 PERF_DEBUG = False        # 打印调试信息（False 关闭）
@@ -92,8 +99,9 @@ except Exception as e:
     print(f"[DETECTOR] YOLOE backend not ready: {e}", flush=True)
 
 # ========= 路径参数（按需修改）=========
-YOLO_MODEL_PATH = r'C:\Users\Administrator\Desktop\rebuild1002\model\shoppingbest5.pt'
-HAND_TASK_PATH  = r"C:\Users\Administrator\Desktop\rebuild1002\model\hand_landmarker.task"
+MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model")
+YOLO_MODEL_PATH = os.getenv("SHOPPINGBEST_MODEL", os.path.join(MODEL_DIR, "shoppingbest5.pt"))
+HAND_TASK_PATH  = os.getenv("HAND_TASK_PATH", os.path.join(MODEL_DIR, "hand_landmarker.task"))
 
 # ========= 摄像头 =========
 CAM_INDEX = 0
@@ -156,7 +164,8 @@ AUDIO_FILES = {
 GUIDANCE_INTERVAL_SEC = 1.5  # 引导播报间隔
 
 # 初始化pygame音频
-pygame.mixer.init()
+if pygame is not None:
+    pygame.mixer.init()
 
 # ========= 窗口 =========
 WINDOW = "YOLO Seg + Flow Polygon (Peri-Relock) (Grab Guidance)"
@@ -166,7 +175,12 @@ BaseOptions           = mp.tasks.BaseOptions
 VisionRunningMode     = mp.tasks.vision.RunningMode
 HandLandmarker        = mp.tasks.vision.HandLandmarker
 HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
-HAND_CONNECTIONS      = mp.solutions.hands.HAND_CONNECTIONS
+try:
+    HAND_CONNECTIONS = mp.solutions.hands.HAND_CONNECTIONS
+    MP_DRAWING_UTILS = mp.solutions.drawing_utils
+except Exception:
+    HAND_CONNECTIONS = mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS
+    MP_DRAWING_UTILS = mp.tasks.vision.drawing_utils
 
 # ======== HandLandmarker 回调缓存 ========
 _last_result = None  # (result, timestamp_ms)
@@ -176,7 +190,12 @@ def on_result(result: mp.tasks.vision.HandLandmarkerResult,
     global _last_result
     _last_result = (result, timestamp_ms)
 
-def _to_proto(hand_lms) -> landmark_pb2.NormalizedLandmarkList:
+def _to_proto(hand_lms):
+    if landmark_pb2 is None:
+        return [
+            landmark_container.NormalizedLandmark(x=p.x, y=p.y, z=p.z)
+            for p in hand_lms
+        ]
     proto = landmark_pb2.NormalizedLandmarkList()
     proto.landmark.extend([
         landmark_pb2.NormalizedLandmark(x=p.x, y=p.y, z=p.z) for p in hand_lms
@@ -185,7 +204,7 @@ def _to_proto(hand_lms) -> landmark_pb2.NormalizedLandmarkList:
 
 # —— 手骨架单色渲染 —— #
 def draw_hands_mono(img_bgr, hand_lms, color=(0, 255, 255), r=2, t=2):
-    mp_drawing = mp.solutions.drawing_utils
+    mp_drawing = MP_DRAWING_UTILS
     landmark_spec   = mp_drawing.DrawingSpec(color=color, thickness=-1, circle_radius=r)
     connection_spec = mp_drawing.DrawingSpec(color=color, thickness=t,  circle_radius=r)
     if hasattr(hand_lms, "landmark"):

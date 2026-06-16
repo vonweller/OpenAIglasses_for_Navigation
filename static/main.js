@@ -4,10 +4,26 @@
 (() => {
   const $camStatus = document.getElementById('camStatus');
   const $asrStatus = document.getElementById('asrStatus');
+  const $camStatusStage = document.getElementById('camStatusStage');
+  const $audioStatusStage = document.getElementById('audioStatusStage');
+  const $stageEmpty = document.getElementById('stageEmpty');
   const $partial   = document.getElementById('partial');
   const $finalList = document.getElementById('finalList');
   const $btnClear  = document.getElementById('btnClear');
   const $btnRe     = document.getElementById('btnReconnect');
+  const $serverHostInput = document.getElementById('serverHostInput');
+  const $serverHostOptions = document.getElementById('serverHostOptions');
+  const $dashscopeKeyInput = document.getElementById('dashscopeKeyInput');
+  const $blindPathModelInput = document.getElementById('blindPathModelInput');
+  const $obstacleModelInput = document.getElementById('obstacleModelInput');
+  const $itemModelInput = document.getElementById('itemModelInput');
+  const $trafficModelInput = document.getElementById('trafficModelInput');
+  const $handTaskInput = document.getElementById('handTaskInput');
+  const $btnSaveRuntime = document.getElementById('btnSaveRuntime');
+  const $runtimeConfigStatus = document.getElementById('runtimeConfigStatus');
+  const $cameraWsText = document.getElementById('cameraWsText');
+  const $audioWsText = document.getElementById('audioWsText');
+  const $imuUdpText = document.getElementById('imuUdpText');
   const $fps       = document.getElementById('fps');
   const canvas     = document.getElementById('canvas');
   const ctx        = canvas.getContext('2d');
@@ -201,9 +217,10 @@
     container.scrollTop = container.scrollHeight;
   }
 
-  function setBadge(el, ok, text){
+  function setBadge(el, ok, text, tone){
+    if (!el) return;
     el.textContent = text;
-    el.className = 'badge ' + (ok? 'ok' : 'err');
+    el.className = 'badge ' + (tone || (ok ? 'ok' : 'err'));
   }
 
   function navLabelAndText(raw) {
@@ -219,16 +236,18 @@
   function fitCanvas(){
     const rect = canvas.getBoundingClientRect();
     const w = Math.max(320, Math.floor(rect.width));
-    const h = Math.max(240, Math.floor(rect.width * 3/4)); // 4:3
+    const h = Math.max(240, Math.floor(rect.height || rect.width * 3/4));
     if (canvas.width !== w || canvas.height !== h) {
       canvas.width = w; canvas.height = h;
     }
   }
   window.addEventListener('resize', fitCanvas); fitCanvas();
 
-  let wsCam, wsUI, frames = 0, fpsTimer = 0;
+  let wsCam, wsUI, frames = 0, fpsTimer = 0, lastFrameAt = 0;
 
   function drawBlob(buf){
+    lastFrameAt = Date.now();
+    if ($stageEmpty) $stageEmpty.classList.add('is-hidden');
     const blob = new Blob([buf], {type:'image/jpeg'});
     if ('createImageBitmap' in window){
       createImageBitmap(blob).then(bmp=>{
@@ -253,11 +272,11 @@
     try{ if (wsCam) wsCam.close(); }catch(e){}
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     wsCam = new WebSocket(`${proto}://${location.host}/ws/viewer`);
-    setBadge($camStatus, false, 'Camera: connecting…');
+    setBadge($camStatus, false, 'Viewer: connecting…', 'warn');
     wsCam.binaryType = 'arraybuffer';
-    wsCam.onopen  = ()=> setBadge($camStatus, true, 'Camera: connected');
-    wsCam.onclose = ()=> setBadge($camStatus, false, 'Camera: disconnected');
-    wsCam.onerror = ()=> setBadge($camStatus, false, 'Camera: error');
+    wsCam.onopen  = ()=> setBadge($camStatus, true, 'Viewer: online');
+    wsCam.onclose = ()=> setBadge($camStatus, false, 'Viewer: offline');
+    wsCam.onerror = ()=> setBadge($camStatus, false, 'Viewer: error');
     wsCam.onmessage = (ev)=> drawBlob(ev.data);
   }
 
@@ -265,10 +284,10 @@
     try{ if (wsUI) wsUI.close(); }catch(e){}
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     wsUI = new WebSocket(`${proto}://${location.host}/ws_ui`);
-    setBadge($asrStatus, false, 'ASR: connecting…');
-    wsUI.onopen  = ()=> setBadge($asrStatus, true, 'ASR: connected');
-    wsUI.onclose = ()=> setBadge($asrStatus, false, 'ASR: disconnected');
-    wsUI.onerror = ()=> setBadge($asrStatus, false, 'ASR: error');
+    setBadge($asrStatus, false, 'UI: connecting…', 'warn');
+    wsUI.onopen  = ()=> setBadge($asrStatus, true, 'UI: online');
+    wsUI.onclose = ()=> setBadge($asrStatus, false, 'UI: offline');
+    wsUI.onerror = ()=> setBadge($asrStatus, false, 'UI: error');
     wsUI.onmessage = (ev)=>{
       const s = ev.data || '';
       if (s.startsWith('INIT:')){
@@ -321,8 +340,140 @@
   };
   $btnRe.onclick    = ()=> { connectCamera(); connectASR(); };
 
+  function normalizeHostPort(value, fallbackPort = '8081') {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    if (raw.includes(':')) return raw;
+    return `${raw}:${fallbackPort}`;
+  }
+
+  function updateEndpointTexts(hostPort) {
+    if (!hostPort) return;
+    const hostOnly = hostPort.split(':')[0];
+    if ($cameraWsText) $cameraWsText.textContent = `ws://${hostPort}/ws/camera`;
+    if ($audioWsText) $audioWsText.textContent = `ws://${hostPort}/ws_audio`;
+    if ($imuUdpText) $imuUdpText.textContent = `${hostOnly}:12345`;
+  }
+
+  async function loadRuntimeConfig() {
+    try {
+      const res = await fetch('/api/runtime-config', { cache: 'no-store' });
+      if (!res.ok) throw new Error(String(res.status));
+      const cfg = await res.json();
+      const hostPort = `${cfg.server_host}:${cfg.server_port || '8081'}`;
+      if ($serverHostInput) $serverHostInput.value = hostPort;
+      if ($serverHostOptions) {
+        $serverHostOptions.innerHTML = '';
+        (cfg.local_ips || []).forEach((ip) => {
+          const option = document.createElement('option');
+          option.value = `${ip}:${cfg.server_port || '8081'}`;
+          $serverHostOptions.appendChild(option);
+        });
+      }
+      updateEndpointTexts(hostPort);
+      if ($runtimeConfigStatus) {
+        $runtimeConfigStatus.textContent = cfg.api_key_configured
+          ? `API Key 已配置（${cfg.api_key_masked || '已隐藏'}）`
+          : 'API Key 未配置';
+      }
+      const models = cfg.models || {};
+      if ($blindPathModelInput) $blindPathModelInput.value = models.blind_path_model || '';
+      if ($obstacleModelInput) $obstacleModelInput.value = models.obstacle_model || '';
+      if ($itemModelInput) $itemModelInput.value = models.item_search_model || '';
+      if ($trafficModelInput) $trafficModelInput.value = models.trafficlight_model || '';
+      if ($handTaskInput) $handTaskInput.value = models.hand_task_path || '';
+    } catch (e) {
+      if ($runtimeConfigStatus) $runtimeConfigStatus.textContent = '配置读取失败';
+    }
+  }
+
+  $serverHostInput?.addEventListener('input', () => {
+    updateEndpointTexts(normalizeHostPort($serverHostInput.value));
+  });
+
+  $btnSaveRuntime?.addEventListener('click', async () => {
+    try {
+      const key = $dashscopeKeyInput?.value?.trim() || '';
+      const blindPathModel = $blindPathModelInput?.value?.trim() || '';
+      const obstacleModel = $obstacleModelInput?.value?.trim() || '';
+      const itemSearchModel = $itemModelInput?.value?.trim() || '';
+      const trafficlightModel = $trafficModelInput?.value?.trim() || '';
+      const handTaskPath = $handTaskInput?.value?.trim() || '';
+      const res = await fetch('/api/runtime-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          dashscope_api_key: key,
+          blind_path_model: blindPathModel,
+          obstacle_model: obstacleModel,
+          item_search_model: itemSearchModel,
+          trafficlight_model: trafficlightModel,
+          hand_task_path: handTaskPath,
+        })
+      });
+      if (!res.ok) throw new Error(String(res.status));
+      const data = await res.json();
+      if ($dashscopeKeyInput) $dashscopeKeyInput.value = '';
+      if ($runtimeConfigStatus) {
+        $runtimeConfigStatus.textContent = data.api_key_configured
+          ? `API Key 已配置（${data.api_key_masked || '已隐藏'}）`
+          : 'API Key 未配置';
+      }
+      updateEndpointTexts(normalizeHostPort($serverHostInput?.value));
+    } catch (e) {
+      if ($runtimeConfigStatus) $runtimeConfigStatus.textContent = '保存失败';
+    }
+  });
+
+  document.querySelectorAll('[data-copy-target]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const id = btn.getAttribute('data-copy-target');
+      const text = document.getElementById(id)?.textContent?.trim() || '';
+      if (!text || text === '-') return;
+      try {
+        await navigator.clipboard.writeText(text);
+        const old = btn.textContent;
+        btn.textContent = '已复制';
+        setTimeout(() => { btn.textContent = old; }, 900);
+      } catch (e) {
+        btn.textContent = '失败';
+        setTimeout(() => { btn.textContent = '复制'; }, 900);
+      }
+    });
+  });
+
+  async function refreshDeviceStatus(){
+    try {
+      const res = await fetch('/api/device-status', { cache: 'no-store' });
+      if (!res.ok) throw new Error(String(res.status));
+      const data = await res.json();
+
+      if (data.camera_connected) {
+        setBadge($camStatusStage, true, 'Camera HW: connected');
+      } else {
+        setBadge($camStatusStage, false, 'Camera HW: waiting', 'warn');
+        if (!lastFrameAt || Date.now() - lastFrameAt > 2500) {
+          if ($stageEmpty) $stageEmpty.classList.remove('is-hidden');
+          $fps.textContent = 'FPS: --';
+        }
+      }
+
+      if (data.audio_connected) {
+        setBadge($audioStatusStage, true, 'Audio HW: connected');
+      } else {
+        setBadge($audioStatusStage, false, 'Audio HW: waiting', 'warn');
+      }
+    } catch (e) {
+      setBadge($camStatusStage, false, 'Camera HW: unknown');
+      setBadge($audioStatusStage, false, 'Audio HW: unknown');
+    }
+  }
+
   connectCamera();
   connectASR();
+  loadRuntimeConfig();
+  refreshDeviceStatus();
+  setInterval(refreshDeviceStatus, 1200);
 })();
 
 
@@ -401,24 +552,12 @@ import { GLTFLoader } from 'https://unpkg.com/three@0.155.0/examples/jsm/loaders
   function syncHeights() {
     if (!container || !hud) return;
     const w = container.clientWidth || 600;
-  
-    // 可选：固定高宽比（例如 const MODEL_ASPECT = 16/9;）
-    // 如果保持 null，就以右侧面板高度为准
-    const MODEL_ASPECT = null;
-  
-    let targetH;
-    if (MODEL_ASPECT && Number(MODEL_ASPECT) > 0) {
-      targetH = Math.max(240, Math.round(w / Number(MODEL_ASPECT)));
-    } else {
-      const padding = 40; // 右侧内边距/标题余量
-      const contentH = (document.getElementById('data-panel')?.offsetHeight || 0) + padding;
-      targetH = Math.max(240, contentH);
-    }
-  
-    hud.style.height = `${targetH}px`;
+    const targetH = container.clientHeight || Math.max(150, Math.min(190, Math.round(w * 0.55)));
+
+    hud.style.height = '';
     hud.style.maxHeight = 'none';
     hud.style.overflow = 'hidden';
-  
+
     container.style.height = `${targetH}px`;
     renderer.setSize(w, targetH);
     camera.aspect = w / targetH;
@@ -433,6 +572,27 @@ import { GLTFLoader } from 'https://unpkg.com/three@0.155.0/examples/jsm/loaders
   // 初次与窗口变化时，同步左右高度
   requestSync();
   window.addEventListener('resize', requestSync);
+  const imuHost = container?.closest('.imu-float');
+  if (imuHost) {
+    const queueResize = (expanded) => {
+      imuHost.classList.toggle('is-expanded', expanded);
+      requestSync();
+      setTimeout(requestSync, 80);
+      setTimeout(requestSync, 240);
+    };
+    imuHost.addEventListener('mouseenter', () => queueResize(true));
+    imuHost.addEventListener('mouseleave', () => queueResize(false));
+    imuHost.addEventListener('pointerenter', () => queueResize(true));
+    imuHost.addEventListener('pointerleave', () => queueResize(false));
+    document.addEventListener('mousemove', (event) => {
+      const r = imuHost.getBoundingClientRect();
+      const inside = event.clientX >= r.left && event.clientX <= r.right &&
+        event.clientY >= r.top && event.clientY <= r.bottom;
+      if (inside !== imuHost.classList.contains('is-expanded')) {
+        queueResize(inside);
+      }
+    }, { passive: true });
+  }
   
   // 数据变化时也同步（放在 updateDataPanel 内）
   function updateDataPanel(roll, pitch, yaw, gx, gy, gz, ax, ay, az) {
@@ -512,22 +672,22 @@ import { GLTFLoader } from 'https://unpkg.com/three@0.155.0/examples/jsm/loaders
     const panel = document.createElement('div');
     panel.id = 'data-panel';
     panel.style.cssText = `
-      position: absolute;
-      right: 20px;
-      bottom: 20px;
+      position: relative;
       background: transparent;
       border: none;
       border-radius: 10px;
-      padding: 15px;
-      min-width: 280px;
+      padding: 14px;
+      min-width: 0;
+      width: 100%;
+      height: 100%;
       color: #e6edf3;
       font-family: 'Consolas','Monaco',monospace;
       font-size: 12px;
       z-index: 1;
       box-shadow: none;
       pointer-events: auto;
-      max-height: none;         /* 不触发滚动条 */
-      overflow: hidden;         /* 兜底：即使超出也不出现滚动条 */
+      max-height: none;
+      overflow: hidden;
     `;
     panel.innerHTML = `
       <div style="margin-bottom:12px;font-weight:bold;color:#61dafb;border-bottom:1px solid #2a3446;padding-bottom:6px;">

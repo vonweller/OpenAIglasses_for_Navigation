@@ -6,23 +6,49 @@
 <title>ESP32 相机 + 实时语音识别 + IMU 可视化</title>
 <style>
   :root{
-    --bg:#0b0f14; --card:#121821; --text:#e6edf3; --muted:#9fb0c3;
-    --ok:#7ee787; --err:#ff8080; --line:#1f2937; --panel:rgba(18,24,33,.65);
+    --bg:#070b10; --card:#101720; --text:#e6edf3; --muted:#9fb0c3;
+    --ok:#7ee787; --err:#ff8080; --warn:#ffd166; --line:#1f2937; --panel:rgba(16,23,32,.76);
   }
   *{box-sizing:border-box}
+  html{height:100%; overflow:hidden}
   body{
-    margin:0; background:linear-gradient(180deg,#0b0f14,#0b0f14 60%,#0e1621);
+    height:100%; overflow:hidden;
+    margin:0; background:linear-gradient(180deg,#070b10,#0b1118 62%,#0d151f);
     color:var(--text);
     font:16px/1.6 system-ui,-apple-system,Segoe UI,Roboto,"Noto Sans","PingFang SC","Hiragino Sans GB","Microsoft YaHei",Arial;
   }
 
   /* 两栏布局 */
-  .app{display:grid; grid-template-columns: 1fr 700px; gap:16px; height:100vh; padding:16px}
+  .app{display:grid; grid-template-columns:minmax(0,1fr) clamp(360px, 27vw, 520px); gap:14px; height:100vh; padding:14px}
   .stage{
     position:relative; border:1px solid var(--line); border-radius:14px;
-    background:#0a1017; box-shadow:0 10px 30px rgba(0,0,0,.25); overflow:hidden;
+    min-width:0; min-height:0;
+    height:100%;
+    background:#020509; box-shadow:0 18px 50px rgba(0,0,0,.35); overflow:hidden;
   }
-  .canvas-wrap, #canvas{position:absolute; inset:0; width:100%; height:100%; display:block; background:#000; z-index:10}
+  .canvas-wrap, #canvas{
+    position:absolute; inset:0; width:100%; height:100%; display:block;
+    background:radial-gradient(circle at 50% 35%,#101922 0,#05080d 48%,#000 100%);
+    z-index:10
+  }
+  .stage-empty{
+    position:absolute; inset:0; z-index:18;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:10px; text-align:center; color:var(--muted);
+    background:
+      linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px);
+    background-size:42px 42px;
+    pointer-events:none;
+  }
+  .stage-empty.is-hidden{display:none}
+  .stage-empty strong{color:var(--text); font-size:22px; letter-spacing:0}
+  .stage-empty span{font-size:14px}
+  .stage-dot{width:12px; height:12px; border-radius:50%; background:var(--warn); box-shadow:0 0 22px rgba(255,209,102,.45)}
+  .stage-status{
+    position:absolute; left:14px; bottom:14px; z-index:30;
+    display:flex; gap:8px; flex-wrap:wrap; align-items:center;
+  }
 
   /* 右上角：参数 + 日志 */
   .tri-panels{
@@ -41,34 +67,56 @@
 
   /* 左上角 IMU 浮窗 —— 宽一些 + 横向布局：左模型 / 右数据 */
   .imu-float{
-    position:absolute; left:12px; top:12px; z-index:35;
-    width: 900px;                /* ← 加长：横向空间更大 */
-    border:2px dashed rgba(255,255,255,.35);
+    position:absolute; right:14px; top:14px; z-index:35;
+    width:min(300px, 34vw);
+    height:190px;
+    border:1px solid rgba(255,255,255,.12);
     border-radius:12px;
     background:var(--panel);
-    backdrop-filter: blur(8px) saturate(130%);
-    box-shadow: inset 0 0 0 1px rgba(255,255,255,.06);
-    padding:10px;
+    backdrop-filter: blur(10px) saturate(130%);
+    box-shadow:0 14px 32px rgba(0,0,0,.34), inset 0 0 0 1px rgba(255,255,255,.04);
+    padding:8px;
+    overflow:hidden;
+    transition: width .22s ease, height .22s ease, background .22s ease, box-shadow .22s ease, transform .22s ease;
+  }
+  .imu-float:hover,
+  .imu-float:focus-within,
+  .imu-float.is-expanded{
+    width:min(52vw, 820px);
+    height:min(52vh, 520px);
+    background:rgba(10,16,24,.94);
+    box-shadow:0 22px 60px rgba(0,0,0,.5), inset 0 0 0 1px rgba(255,255,255,.06);
   }
   .imu-row{
+    display:block;
+    height:100%;
+  }
+  .imu-float:hover .imu-row,
+  .imu-float:focus-within .imu-row,
+  .imu-float.is-expanded .imu-row{
     display:grid;
-    grid-template-columns: 1.8fr 1fr;  /* ← 左更宽，右放数据 */
+    grid-template-columns:minmax(0, 1.25fr) minmax(270px, .75fr);
     gap:12px;
-    align-items:stretch;
   }
   #imu_view{
     position:relative;
-    min-height: 300px;           /* ← 模型区域更高 */
-    background:#0a1017; border-radius:10px;
+    height: 100%;
+    min-height: 0;
+    background:#081018; border-radius:10px;
   }
   #imu_hud{
   border-radius: 10px;
-  background: rgba(18, 24, 33, 0.8);  /* 改为半透明 */
+  background: rgba(8, 14, 22, 0.84);
   border: none;
-  padding: 10px;
-  overflow-y: auto;  /* 启用垂直滚动条 */
-  max-height: 100vh;  /* 设置最大高度为视口高度，自动撑满 */
+  display:none;
+  height:100%;
+  overflow:hidden;
 }
+  .imu-float:hover #imu_hud,
+  .imu-float:focus-within #imu_hud,
+  .imu-float.is-expanded #imu_hud{
+    display:block !important;
+  }
 
 #imu_hud::-webkit-scrollbar {
   width: 8px;  /* 滚动条的宽度 */
@@ -111,13 +159,14 @@
     background: var(--card);
     box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
     overflow: hidden;
-    height: 100vh; /* 确保 .chat 容器占据整个视口高度 */
+    height: 100%;
+    min-width:0;
   }
 
   .chat-head{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid var(--line)}
   .badges{display:flex;gap:10px;flex-wrap:wrap}
-  .badge{font-size:12px;padding:4px 8px;border-radius:999px;border:1px solid #2d3b50;color:var(--muted)}
-  .ok{color:var(--ok);border-color:var(--ok)} .err{color:var(--err);border-color:var(--err)}
+  .badge{font-size:12px;padding:4px 8px;border-radius:999px;border:1px solid #2d3b50;color:var(--muted);white-space:nowrap}
+  .ok{color:var(--ok);border-color:var(--ok)} .err{color:var(--err);border-color:var(--err)} .warn{color:var(--warn);border-color:var(--warn)}
   .chat-list {
     flex: 1;
     overflow: auto;
@@ -127,6 +176,40 @@
     gap: 10px;
     min-height: 0; /* 确保 .chat-list 不会被外部内容撑大 */
   }
+
+  .config-panel{
+    padding:12px;
+    border:1px solid #203047;
+    border-radius:12px;
+    background:#0c121a;
+  }
+  .config-panel h2{margin:0 0 10px 0;font-size:14px;color:var(--muted);font-weight:700}
+  .config-grid{display:grid;grid-template-columns:1fr;gap:8px}
+  .config-section-title{
+    margin:12px 0 2px 0;
+    color:#d6e2f0;
+    font-size:12px;
+    font-weight:700;
+  }
+  .field-row{display:grid;grid-template-columns:92px minmax(0,1fr);gap:8px;align-items:center}
+  .field-row label{font-size:12px;color:var(--muted)}
+  .field-row input{
+    width:100%; min-width:0;
+    background:#071019; color:var(--text);
+    border:1px solid #26364c; border-radius:8px;
+    padding:7px 9px; font:12px/1.4 Consolas,monospace;
+  }
+  .config-actions{display:flex;gap:8px;margin-top:8px;align-items:center}
+  .config-actions button{padding:7px 10px;border-radius:8px;font-size:12px}
+  .mini-status{font-size:12px;color:var(--muted)}
+  .endpoint-list{display:grid;gap:6px;margin-top:10px}
+  .endpoint-row{
+    display:grid;grid-template-columns:70px minmax(0,1fr) auto;gap:6px;align-items:center;
+    padding:6px;border:1px solid #1b2a3e;border-radius:8px;background:#08111a;
+  }
+  .endpoint-row span{font-size:12px;color:var(--muted)}
+  .endpoint-row code{font-size:11px;color:#d6e2f0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .copy-btn{padding:5px 8px;border-radius:7px;background:#152337;border-color:#2b3e58;color:#c8d7e8;font-size:11px}
 
   .live{padding:12px;border:1px dashed #2d3b50;border-radius:12px;background:#0c121a}
   .live h2{margin:0 0 8px 0;font-size:14px;color:var(--muted);font-weight:600}
@@ -156,8 +239,20 @@
   .hidden-controls{display:none}
 
   @media (max-width:1100px){
-    .app{grid-template-columns:1fr; height:auto}
-    .chat{height:60vh}
+    .app{grid-template-columns:1fr; grid-template-rows:minmax(420px, 62vh) minmax(260px, 38vh); height:100vh}
+    .stage{height:100%; min-height:420px}
+    .chat{height:100%; min-height:0}
+    body, html{overflow:auto}
+    .imu-float{width:min(300px, calc(100vw - 56px)); height:170px}
+    .imu-float:hover,
+    .imu-float:focus-within,
+    .imu-float.is-expanded{width:calc(100vw - 56px); height:min(58vh, 520px)}
+    .imu-float:hover .imu-row,
+    .imu-float:focus-within .imu-row,
+    .imu-float.is-expanded .imu-row{grid-template-columns:minmax(0, 1fr) minmax(250px, .8fr)}
+    .imu-float:hover #imu_hud,
+    .imu-float:focus-within #imu_hud,
+    .imu-float.is-expanded #imu_hud{display:block !important}
   }
 </style>
 </head>
@@ -167,6 +262,15 @@
   <!-- 左侧主舞台 -->
   <section class="stage">
     <div class="canvas-wrap"><canvas id="canvas"></canvas></div>
+    <div id="stageEmpty" class="stage-empty">
+      <div class="stage-dot"></div>
+      <strong>等待摄像头设备</strong>
+      <span>后端已运行，ESP32 摄像头尚未接入</span>
+    </div>
+    <div class="stage-status">
+      <span id="camStatusStage" class="badge warn">Camera HW: waiting</span>
+      <span id="audioStatusStage" class="badge warn">Audio HW: waiting</span>
+    </div>
 
     <!-- 左上角：IMU 浮窗（横向） -->
     <div class="imu-float">
@@ -189,8 +293,8 @@
   <aside class="chat">
     <div class="chat-head">
       <div class="badges">
-        <span id="camStatus" class="badge">Camera: connecting…</span>
-        <span id="asrStatus" class="badge">ASR: connecting…</span>
+        <span id="camStatus" class="badge">Viewer: connecting…</span>
+        <span id="asrStatus" class="badge">UI: connecting…</span>
         <span id="fps" class="badge">FPS: --</span>
       </div>
       <div class="controls">
@@ -199,6 +303,50 @@
       </div>
     </div>
     <div class="chat-list">
+      <div class="config-panel">
+        <h2>设备接入 / 运行配置</h2>
+        <div class="config-grid">
+          <div class="field-row">
+            <label for="serverHostInput">服务 IP</label>
+            <input id="serverHostInput" type="text" list="serverHostOptions" placeholder="例如 192.168.1.10">
+            <datalist id="serverHostOptions"></datalist>
+          </div>
+          <div class="field-row">
+            <label for="dashscopeKeyInput">API Key</label>
+            <input id="dashscopeKeyInput" type="password" placeholder="DASHSCOPE_API_KEY">
+          </div>
+          <div class="config-section-title">模型路径</div>
+          <div class="field-row">
+            <label for="blindPathModelInput">盲道分割</label>
+            <input id="blindPathModelInput" type="text" placeholder="model/yolo-seg.pt">
+          </div>
+          <div class="field-row">
+            <label for="obstacleModelInput">障碍 YOLOE</label>
+            <input id="obstacleModelInput" type="text" placeholder="model/yoloe-11l-seg.pt">
+          </div>
+          <div class="field-row">
+            <label for="itemModelInput">找物 YOLOE</label>
+            <input id="itemModelInput" type="text" placeholder="model/yoloe-11l-seg.pt">
+          </div>
+          <div class="field-row">
+            <label for="trafficModelInput">红绿灯</label>
+            <input id="trafficModelInput" type="text" placeholder="model/trafficlight.pt">
+          </div>
+          <div class="field-row">
+            <label for="handTaskInput">手势模型</label>
+            <input id="handTaskInput" type="text" placeholder="model/hand_landmarker.task">
+          </div>
+        </div>
+        <div class="config-actions">
+          <button id="btnSaveRuntime">保存配置</button>
+          <span id="runtimeConfigStatus" class="mini-status">读取配置中…</span>
+        </div>
+        <div class="endpoint-list">
+          <div class="endpoint-row"><span>摄像头</span><code id="cameraWsText">-</code><button class="copy-btn" data-copy-target="cameraWsText">复制</button></div>
+          <div class="endpoint-row"><span>音频</span><code id="audioWsText">-</code><button class="copy-btn" data-copy-target="audioWsText">复制</button></div>
+          <div class="endpoint-row"><span>IMU UDP</span><code id="imuUdpText">-</code><button class="copy-btn" data-copy-target="imuUdpText">复制</button></div>
+        </div>
+      </div>
       <div class="live">
         <h2>流式识别（Partial）</h2>
         <div class="partial" id="partial">（等待音频…）</div>
@@ -239,6 +387,6 @@
 }</script>
 
 <!-- 主脚本 -->
-<script type="module" src="/static/main.js"></script>
+<script type="module" src="/static/main.js?v=20260616-models1"></script>
 </body>
 </html>
