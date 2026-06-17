@@ -45,7 +45,7 @@ http://127.0.0.1:8081/
 ### 启动桌面 ESP32 模拟器
 
 ```bash
-python desktop_esp32_simulator.py --host 127.0.0.1 --port 8081
+python tools/desktop_esp32_simulator.py --host 127.0.0.1 --port 8081
 ```
 
 模拟器用途：
@@ -351,13 +351,13 @@ mobileclip_blt.ts
 模型准备：
 
 ```bash
-python prepare_models.py
+python tools/prepare_models.py
 ```
 
 ## 12. 快速测试清单
 
 1. 启动后端：`python app_main.py`
-2. 启动模拟器：`python desktop_esp32_simulator.py --host 127.0.0.1 --port 8081`
+2. 启动模拟器：`python tools/desktop_esp32_simulator.py --host 127.0.0.1 --port 8081`
 3. 打开页面：`http://127.0.0.1:8081/`
 4. 打开模拟器麦克风和播放开关
 5. 确认页面显示：

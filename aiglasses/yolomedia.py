@@ -27,13 +27,14 @@ except ModuleNotFoundError:
     from mediapipe.tasks.python.components.containers import landmark as landmark_container
 from ultralytics import YOLO
 from ultralytics.utils.plotting import Colors
-import bridge_io
+from . import bridge_io
+from .paths import MODEL_DIR as PROJECT_MODEL_DIR
 try:
     import pygame  # 用于播放本地音频文件
 except ModuleNotFoundError:
     pygame = None
 
-from audio_player import play_audio_threadsafe
+from .audio_player import play_audio_threadsafe
 PERF_DEBUG = False        # 打印调试信息（False 关闭）
 HAND_DOWNSCALE = 0.8      # HandLandmarker 的输入缩放 0.5=长宽各减半（≈1/4 像素量）
 HAND_FPS_DIV = 1          # 人手每 2 帧跑一次（1=每帧；2=隔帧；3=每3帧）
@@ -92,14 +93,14 @@ def draw_command_pill(img_bgr: np.ndarray, label: str):
     draw_text_cn(img_bgr, full_text, (0, 0), font_size=UNIFIED_FONT_PX, color=(255,255,255), ui_hint=True)
 
 try:
-    from yoloe_backend import YoloEBackend
+    from .yoloe_backend import YoloEBackend
     _YOLOE_READY = True
 except Exception as e:
     _YOLOE_READY = False
     print(f"[DETECTOR] YOLOE backend not ready: {e}", flush=True)
 
 # ========= 路径参数（按需修改）=========
-MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model")
+MODEL_DIR = str(PROJECT_MODEL_DIR)
 YOLO_MODEL_PATH = os.getenv("SHOPPINGBEST_MODEL", os.path.join(MODEL_DIR, "shoppingbest5.pt"))
 HAND_TASK_PATH  = os.getenv("HAND_TASK_PATH", os.path.join(MODEL_DIR, "hand_landmarker.task"))
 

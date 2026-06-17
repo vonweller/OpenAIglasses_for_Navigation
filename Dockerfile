@@ -55,5 +55,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD curl -f http://localhost:8081/api/health || exit 1
 
 # 启动命令
-CMD ["python3", "app_main.py"]
+CMD ["python3", "-m", "aiglasses.app_main"]
 

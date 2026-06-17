@@ -2,7 +2,7 @@
 
 <div align="center">
 
-一个面向视障人士的智能导航与辅助系统，集成了盲道导航、过马路辅助、物品识别、实时语音交互等功能。  本项目仅为交流学习使用，请勿直接给视障人群使用。本项目内仅包含代码，模型地址：https://www.modelscope.cn/models/archifancy/AIGlasses_for_navigation  。请按下文的安装脚本或 `python prepare_models.py` 自动下载并放到正确位置
+一个面向视障人士的智能导航与辅助系统，集成了盲道导航、过马路辅助、物品识别、实时语音交互等功能。  本项目仅为交流学习使用，请勿直接给视障人群使用。本项目内仅包含代码，模型地址：https://www.modelscope.cn/models/archifancy/AIGlasses_for_navigation  。请按下文的安装脚本或 `python tools/prepare_models.py` 自动下载并放到正确位置
 
 [功能特性](#功能特性) • [快速开始](#快速开始) • [系统架构](#系统架构) • [使用说明](#使用说明) • [开发文档](#开发文档)
 
@@ -152,7 +152,7 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available(), tor
 推荐直接运行模型准备脚本，它会创建 `model/` 目录，并把项目模型放到正确位置：
 
 ```bash
-python prepare_models.py
+python tools/prepare_models.py
 ```
 
 脚本会优先从 ModelScope 模型仓库拉取项目模型：
@@ -402,7 +402,7 @@ python app_main.py
 开发调试时可以运行：
 
 ```bash
-python desktop_esp32_simulator.py --host 127.0.0.1 --port 8081
+python tools/desktop_esp32_simulator.py --host 127.0.0.1 --port 8081
 ```
 
 模拟器包含两条音频链路：

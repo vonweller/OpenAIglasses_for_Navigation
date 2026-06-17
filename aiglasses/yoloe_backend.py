@@ -5,6 +5,7 @@ import os
 import cv2
 import numpy as np
 import torch
+from .paths import MODEL_DIR as PROJECT_MODEL_DIR
 
 # 兼容 YOLOE / YOLO
 try:
@@ -14,7 +15,7 @@ except Exception:
 
 DEFAULT_MODEL_PATH = os.getenv(
     "YOLOE_MODEL_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "model", "yoloe-11l-seg.pt"),
+    os.path.join(str(PROJECT_MODEL_DIR), "yoloe-11l-seg.pt"),
 )
 TRACKER_CFG        = os.getenv("YOLO_TRACKER_YAML", "bytetrack.yaml")
 

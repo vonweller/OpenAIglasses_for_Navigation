@@ -15,7 +15,7 @@ import numpy as np
 import cv2
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
-# 【移除】from audio_player import play_voice_text - 不在工作流内部播放音频
+# 【移除】from .audio_player import play_voice_text - 不在工作流内部播放音频
 
 # 可选：用于更精致的数据面板（与 blindpath 一致）
 try:
@@ -27,13 +27,13 @@ except ImportError:
 
 # 可选：自动启用障碍物检测（与 blindpath 一致）
 try:
-    from obstacle_detector_client import ObstacleDetectorClient
+    from .obstacle_detector_client import ObstacleDetectorClient
 except Exception:
     ObstacleDetectorClient = None
 
 # 红绿灯检测模块
 try:
-    import trafficlight_detection
+    from . import trafficlight_detection
     TRAFFIC_LIGHT_AVAILABLE = True
 except Exception:
     TRAFFIC_LIGHT_AVAILABLE = False

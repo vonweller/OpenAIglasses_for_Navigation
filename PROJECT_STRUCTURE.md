@@ -6,109 +6,49 @@
 
 ```
 rebuild1002/
-├── 📄 主要应用文件
-│   ├── app_main.py                    # 主应用入口（FastAPI 服务）
-│   ├── navigation_master.py           # 导航统领器（状态机）
-│   ├── workflow_blindpath.py          # 盲道导航工作流
-│   ├── workflow_crossstreet.py        # 过马路导航工作流
-│   └── yolomedia.py                   # 物品查找工作流
-│
-├── 🎙️ 语音处理模块
-│   ├── asr_core.py                    # 语音识别核心
-│   ├── omni_client.py                 # Qwen-Omni 客户端
-│   ├── qwen_extractor.py              # 标签提取（中文->英文）
-│   ├── audio_player.py                # 音频播放器
-│   └── audio_stream.py                # 音频流管理
-│
-├── 🤖 模型相关
-│   ├── yoloe_backend.py               # YOLO-E 后端（开放词汇）
-│   ├── trafficlight_detection.py      # 红绿灯检测
-│   ├── obstacle_detector_client.py    # 障碍物检测客户端
-│   └── models.py                      # 模型定义
-│
-├── 🎥 视频处理
-│   ├── bridge_io.py                   # 线程安全的帧缓冲
-│   ├── sync_recorder.py               # 音视频同步录制
-│   └── video_recorder.py              # 视频录制（旧版）
-│
-├── 🌐 Web 前端
-│   ├── templates/
-│   │   └── index.html                 # 主界面 HTML
-│   ├── static/
-│   │   ├── main.js                    # 主 JS 脚本
-│   │   ├── vision.js                  # 视觉流处理
-│   │   ├── visualizer.js              # 数据可视化
-│   │   ├── vision_renderer.js         # 渲染器
-│   │   ├── vision.css                 # 样式表
-│   │   └── models/                    # 3D 模型（IMU 可视化）
-│
-├── 🎵 音频资源
-│   ├── music/                         # 系统提示音
-│   │   ├── converted_向上.wav
-│   │   ├── converted_向下.wav
-│   │   └── ...
-│   └── voice/                         # 预录语音
-│       ├── voice_mapping.json
-│       └── *.wav
-│
-├── 🧠 模型文件
-│   └── model/
-│       ├── yolo-seg.pt                # 盲道分割模型
-│       ├── yoloe-11l-seg.pt           # YOLO-E 开放词汇模型
-│       ├── shoppingbest5.pt           # 物品识别模型
-│       ├── trafficlight.pt            # 红绿灯检测模型
-│       └── hand_landmarker.task       # MediaPipe 手部模型
-│
-├── mobileclip_blt.ts                  # YOLOE 文本提示特征文件（根目录）
-│
-├── 📹 录制文件
-│   └── recordings/                    # 自动保存的视频和音频
-│       ├── video_*.avi
-│       └── audio_*.wav
-│
-├── 🛠️ ESP32 固件
-│   └── compile/
-│       ├── compile.ino                # Arduino 主程序
-│       ├── camera_pins.h              # 摄像头引脚定义
-│       ├── ICM42688.cpp/h             # IMU 驱动
-│       └── ESP32_VIDEO_OPTIMIZATION.md
-│
-├── 🧪 测试文件
-│   ├── test_recorder.py               # 录制功能测试
-│   ├── test_traffic_light.py          # 红绿灯检测测试
-│   ├── test_cross_street_blindpath.py # 导航测试
-│   └── test_crosswalk_awareness.py    # 斑马线检测测试
-│
-├── 📚 文档
-│   ├── README.md                      # 项目主文档
-│   ├── INSTALLATION.md                # 安装指南
-│   ├── CONTRIBUTING.md                # 贡献指南
-│   ├── FAQ.md                         # 常见问题
-│   ├── CHANGELOG.md                   # 更新日志
-│   ├── SECURITY.md                    # 安全政策
-│   └── PROJECT_STRUCTURE.md           # 本文件
-│
-├── 🐳 Docker 相关
-│   ├── Dockerfile                     # Docker 镜像定义
-│   ├── docker-compose.yml             # Docker Compose 配置
-│   └── .dockerignore                  # Docker 忽略文件
-│
-├── ⚙️ 配置文件
-│   ├── .env.example                   # 环境变量模板
-│   ├── .gitignore                     # Git 忽略文件
-│   ├── requirements.txt               # Python 依赖
-│   ├── setup.sh                       # Linux/macOS 安装脚本
-│   └── setup.bat                      # Windows 安装脚本
-│
-├── 📄 许可证
-│   └── LICENSE                        # MIT 许可证
-│
-└── 🔧 GitHub 相关
-    └── .github/
-        ├── ISSUE_TEMPLATE/
-        │   ├── bug_report.md
-        │   └── feature_request.md
-        └── pull_request_template.md
+??? app_main.py                        # ??????python app_main.py
+??? prepare_models.py                  # ??????python prepare_models.py
+??? desktop_esp32_simulator.py         # ??????python desktop_esp32_simulator.py
+??? aiglasses/                         # ?????
+?   ??? app_main.py                    # FastAPI ???? WebSocket ??
+?   ??? navigation_master.py           # ??????????
+?   ??? workflow_blindpath.py          # ???????
+?   ??? workflow_crossstreet.py        # ???/??????
+?   ??? yolomedia.py                   # ??????
+?   ??? yoloe_backend.py               # YOLOE ??????
+?   ??? trafficlight_detection.py      # ?????
+?   ??? obstacle_detector_client.py    # ????????
+?   ??? asr_core.py                    # ?? ASR ??
+?   ??? omni_client.py                 # Qwen-Omni ???
+?   ??? qwen_extractor.py              # ???????? label
+?   ??? audio_player.py                # ???????
+?   ??? audio_stream.py                # /stream.wav ?????
+?   ??? bridge_io.py                   # ???? YOLO ???
+?   ??? sync_recorder.py               # ???????
+?   ??? paths.py                       # ????????
+??? tools/                             # ??/??????
+?   ??? prepare_models.py              # ???????
+?   ??? desktop_esp32_simulator.py     # ?? ESP32 ???
+??? templates/                         # Web ??
+?   ??? index.html
+??? static/                            # Web ????
+?   ??? main.js
+?   ??? models/                        # IMU 3D ??
+??? model/                             # ?????????
+?   ??? yolo-seg.pt
+?   ??? yoloe-11l-seg.pt
+?   ??? shoppingbest5.pt
+?   ??? trafficlight.pt
+?   ??? hand_landmarker.task
+??? voice/                             # ??????????
+??? music/                             # ???????
+??? recordings/                        # ???????????
+??? compile/                           # ESP32 ??
+??? FUNCTION_FRAMEWORK.md              # ???????????
+??? README.md
+??? requirements.txt
+??? setup.bat / setup.sh
+??? Dockerfile / docker-compose.yml
 ```
 
 ## 🔑 核心文件说明

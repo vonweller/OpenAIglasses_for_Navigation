@@ -9,8 +9,8 @@ from typing import Optional, Dict, Any, Deque, List, Tuple
 from collections import deque
 
 # 工作流导入（与现有文件解耦）
-from workflow_blindpath import BlindPathNavigator, ProcessingResult as BlindResult
-from workflow_crossstreet import CrossStreetNavigator, CrossStreetResult as CrossResult
+from .workflow_blindpath import BlindPathNavigator, ProcessingResult as BlindResult
+from .workflow_crossstreet import CrossStreetNavigator, CrossStreetResult as CrossResult
 
 # ========== 状态常量 ==========
 IDLE = "IDLE"                          # 空闲/未启用
@@ -69,7 +69,7 @@ class TrafficLightDetector:
         self.backend = None
         try:
             # 尝试动态导入（根据你本地 yoloe_backend 的接口调整）
-            import yoloe_backend as _yeb  # noqa
+            from . import yoloe_backend as _yeb  # noqa
             self.backend = _yeb
             self.has_backend = True
         except Exception:

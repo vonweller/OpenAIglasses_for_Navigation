@@ -8,8 +8,9 @@ import asyncio
 import threading
 import queue
 import time
-from audio_stream import broadcast_pcm16_realtime
-from audio_compressor import compressed_audio_cache, AudioCompressor
+from .audio_stream import broadcast_pcm16_realtime
+from .audio_compressor import compressed_audio_cache, AudioCompressor
+from .paths import VOICE_DIR as PROJECT_VOICE_DIR
 
 # 导入录制器（避免循环导入，在需要时动态导入）
 _recorder_imported = False
@@ -20,7 +21,7 @@ def _get_recorder():
     global _recorder_imported, _sync_recorder
     if not _recorder_imported:
         try:
-            import sync_recorder as sr
+            from . import sync_recorder as sr
             _sync_recorder = sr
             _recorder_imported = True
         except Exception as e:
@@ -33,7 +34,7 @@ AUDIO_BASE_DIR = r"C:\Users\Administrator\Desktop\rebuild1002\music"
 
 # 新增：voice 目录与映射表
 # 使用脚本所在目录的 voice 文件夹，避免工作目录问题
-VOICE_DIR = os.getenv("VOICE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice"))
+VOICE_DIR = os.getenv("VOICE_DIR", str(PROJECT_VOICE_DIR))
 VOICE_MAP_FILE = os.path.join(VOICE_DIR, "map.zh-CN.json")
 
 # 音频文件映射（将合并 voice 映射）

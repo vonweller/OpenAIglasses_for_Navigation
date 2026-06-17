@@ -90,7 +90,7 @@ async def broadcast_pcm16_realtime(pcm16: bytes):
 
     # 【新增】录制音频（在分发之前整体录制，避免分片）
     try:
-        import sync_recorder
+        from . import sync_recorder
         sync_recorder.record_audio(pcm16, text="[Omni对话]")
     except Exception:
         pass  # 静默失败，不影响播放

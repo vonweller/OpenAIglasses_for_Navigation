@@ -145,7 +145,7 @@ echo -e "${GREEN}✓ 目录结构已创建${NC}"
 # 下载/检查模型文件
 echo ""
 echo "正在准备模型文件..."
-if ! python prepare_models.py; then
+if ! python tools/prepare_models.py; then
     echo -e "${YELLOW}警告: 模型自动准备未完全成功，请按 README 中的模型说明手动补齐${NC}"
 fi
 

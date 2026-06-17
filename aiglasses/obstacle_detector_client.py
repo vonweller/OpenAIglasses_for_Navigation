@@ -8,6 +8,7 @@ from threading import Semaphore
 from contextlib import contextmanager
 from ultralytics import YOLOE
 from typing import List, Dict, Any
+from .paths import MODEL_DIR as PROJECT_MODEL_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,9 @@ def gpu_infer_slot():
 
 
 class ObstacleDetectorClient:
-    def __init__(self, model_path: str = 'models/yoloe-11l-seg.pt'):
+    def __init__(self, model_path: str | None = None):
+        if model_path is None:
+            model_path = os.path.join(str(PROJECT_MODEL_DIR), "yoloe-11l-seg.pt")
         self.model = None
         self.whitelist_embeddings = None
         self.WHITELIST_CLASSES = [

@@ -12,7 +12,7 @@ from app.cloud.obstacle_detector_client import ObstacleDetectorClient
 # 这是过马路工作流使用的封装类
 from app.cloud.crosswalk_detector_client import CrosswalkDetector
 from app.cloud.coco_perception_client import COCOClient
-from obstacle_detector_client import ObstacleDetectorClient
+from .obstacle_detector_client import ObstacleDetectorClient
 
 # 这是盲道工作流直接使用的 Ultralytics 类
 from ultralytics import YOLO, YOLOE

@@ -13,9 +13,9 @@ from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 from collections import deque
 import torch  # 添加这行
-from obstacle_detector_client import ObstacleDetectorClient
-from audio_player import play_voice_text  # 新增
-from crosswalk_awareness import CrosswalkAwarenessMonitor, split_combined_voice  # 斑马线感知
+from .obstacle_detector_client import ObstacleDetectorClient
+from .audio_player import play_voice_text  # 新增
+from .crosswalk_awareness import CrosswalkAwarenessMonitor, split_combined_voice  # 斑马线感知
 # 尝试导入 Pillow，用于中文显示
 try:
     from PIL import Image, ImageDraw, ImageFont

@@ -11,8 +11,9 @@ import threading
 import cv2
 import numpy as np
 from ultralytics import YOLO
-import bridge_io
-from audio_player import play_voice_text  # 使用统一的语音播放接口
+from . import bridge_io
+from .audio_player import play_voice_text  # 使用统一的语音播放接口
+from .paths import MODEL_DIR as PROJECT_MODEL_DIR
 import logging
 
 logger = logging.getLogger(__name__)
@@ -20,7 +21,7 @@ logger = logging.getLogger(__name__)
 # ========= 配置参数 =========
 YOLO_MODEL_PATH = os.getenv(
     "TRAFFICLIGHT_MODEL",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "model", "trafficlight.pt"),
+    os.path.join(str(PROJECT_MODEL_DIR), "trafficlight.pt"),
 )
 
 # ========= 显示参数 =========

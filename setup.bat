@@ -119,7 +119,7 @@ echo [成功] 目录结构已创建
 REM 下载/检查模型文件
 echo.
 echo 正在准备模型文件...
-python prepare_models.py
+python tools/prepare_models.py
 if errorlevel 1 (
     echo [警告] 模型自动准备未完全成功，请按 README 中的模型说明手动补齐
 )
