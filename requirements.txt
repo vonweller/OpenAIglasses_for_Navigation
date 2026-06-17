@@ -13,8 +13,8 @@ opencv-python==4.8.1.78
 numpy==1.24.3
 Pillow==10.1.0
 ultralytics==8.3.200
-torch==2.0.1
-torchvision==0.15.2
+torch==2.5.1
+torchvision==0.20.1
 
 # MediaPipe (Hand Detection)
 mediapipe==0.10.8
@@ -30,6 +30,7 @@ openai==1.3.5  # For DashScope compatibility mode
 
 # Environment & Configuration
 python-dotenv==1.0.0
+modelscope>=1.23.0,<2
 
 # Utilities
 opencv-contrib-python==4.8.1.78  # Extended OpenCV modules
@@ -57,6 +58,6 @@ opencv-contrib-python==4.8.1.78  # Extended OpenCV modules
 # CUDA Dependencies (GPU acceleration)
 # - CUDA Toolkit 11.8+: https://developer.nvidia.com/cuda-downloads
 # - cuDNN 8.6+: https://developer.nvidia.com/cudnn
-# PyTorch with CUDA support:
-# pip install torch==2.0.1+cu118 torchvision==0.15.2+cu118 --index-url https://download.pytorch.org/whl/cu118
+# PyTorch with CUDA support (recommended on RTX 3060 / NVIDIA driver CUDA 12.x):
+# pip install --upgrade --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu121
 

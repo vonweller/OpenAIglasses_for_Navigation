@@ -20,7 +20,8 @@ TRACKER_CFG        = os.getenv("YOLO_TRACKER_YAML", "bytetrack.yaml")
 
 class YoloEBackend:
     def __init__(self, model_path: Optional[str] = None, device: Optional[Union[str, int]] = None):
-        self.model = _MODEL(model_path or DEFAULT_MODEL_PATH)
+        self.model_path = model_path or DEFAULT_MODEL_PATH
+        self.model = _MODEL(self.model_path)
         if device is not None:
             self.device = device
         elif torch.cuda.is_available():

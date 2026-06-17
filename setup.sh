@@ -142,9 +142,16 @@ echo "正在创建目录结构..."
 mkdir -p recordings model music voice
 echo -e "${GREEN}✓ 目录结构已创建${NC}"
 
+# 下载/检查模型文件
+echo ""
+echo "正在准备模型文件..."
+if ! python prepare_models.py; then
+    echo -e "${YELLOW}警告: 模型自动准备未完全成功，请按 README 中的模型说明手动补齐${NC}"
+fi
+
 # 检查模型文件
 echo ""
-echo "正在检查模型文件..."
+echo "正在复核模型文件..."
 MODELS=("yolo-seg.pt" "yoloe-11l-seg.pt" "shoppingbest5.pt" "trafficlight.pt" "hand_landmarker.task")
 MISSING_MODELS=()
 
@@ -157,13 +164,20 @@ for model in "${MODELS[@]}"; do
     fi
 done
 
+if [ -f "mobileclip_blt.ts" ]; then
+    echo -e "${GREEN}✓ mobileclip_blt.ts${NC}"
+else
+    echo -e "${RED}✗ mobileclip_blt.ts (缺失)${NC}"
+    MISSING_MODELS+=("mobileclip_blt.ts")
+fi
+
 if [ ${#MISSING_MODELS[@]} -gt 0 ]; then
     echo ""
     echo -e "${YELLOW}警告: 缺少以下模型文件:${NC}"
     for model in "${MISSING_MODELS[@]}"; do
         echo "  - $model"
     done
-    echo "请将模型文件放入 model/ 目录"
+    echo "请将模型文件放入 README 指定位置"
 fi
 
 # 完成
@@ -176,7 +190,7 @@ echo "下一步:"
 echo "1. 编辑 .env 文件，填入您的 API 密钥:"
 echo "   nano .env"
 echo ""
-echo "2. 确保所有模型文件已放入 model/ 目录"
+echo "2. 确保模型文件已放入 model/，并且 mobileclip_blt.ts 位于项目根目录"
 echo ""
 echo "3. 启动系统:"
 echo "   source venv/bin/activate"

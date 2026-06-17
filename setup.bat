@@ -116,19 +116,28 @@ if not exist music mkdir music
 if not exist voice mkdir voice
 echo [成功] 目录结构已创建
 
+REM 下载/检查模型文件
+echo.
+echo 正在准备模型文件...
+python prepare_models.py
+if errorlevel 1 (
+    echo [警告] 模型自动准备未完全成功，请按 README 中的模型说明手动补齐
+)
+
 REM 检查模型文件
 echo.
-echo 正在检查模型文件...
+echo 正在复核模型文件...
 set MISSING=0
 if exist model\yolo-seg.pt (echo [成功] yolo-seg.pt) else (echo [缺失] yolo-seg.pt & set MISSING=1)
 if exist model\yoloe-11l-seg.pt (echo [成功] yoloe-11l-seg.pt) else (echo [缺失] yoloe-11l-seg.pt & set MISSING=1)
 if exist model\shoppingbest5.pt (echo [成功] shoppingbest5.pt) else (echo [缺失] shoppingbest5.pt & set MISSING=1)
 if exist model\trafficlight.pt (echo [成功] trafficlight.pt) else (echo [缺失] trafficlight.pt & set MISSING=1)
 if exist model\hand_landmarker.task (echo [成功] hand_landmarker.task) else (echo [缺失] hand_landmarker.task & set MISSING=1)
+if exist mobileclip_blt.ts (echo [成功] mobileclip_blt.ts) else (echo [缺失] mobileclip_blt.ts & set MISSING=1)
 
 if %MISSING%==1 (
     echo.
-    echo [警告] 部分模型文件缺失，请将模型文件放入 model\ 目录
+    echo [警告] 部分模型文件缺失，请将模型文件放入 README 指定位置
 )
 
 REM 完成
@@ -141,7 +150,7 @@ echo 下一步:
 echo 1. 编辑 .env 文件，填入您的 API 密钥:
 echo    notepad .env
 echo.
-echo 2. 确保所有模型文件已放入 model\ 目录
+echo 2. 确保模型文件已放入 model\，并且 mobileclip_blt.ts 位于项目根目录
 echo.
 echo 3. 启动系统:
 echo    venv\Scripts\activate

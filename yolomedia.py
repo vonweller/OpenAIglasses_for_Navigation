@@ -149,6 +149,9 @@ TRACK_EPSILON_FACTOR = 0.003    # 追踪模式下的轮廓精度因子
 # ========= YOLO实时矫正参数 =========
 YOLO_CORRECTION_IOU_THRESHOLD = 0.2  # IoU阈值，越低越积极矫正
 YOLO_CORRECTION_CONF_THRESHOLD = 0.15  # 置信度阈值，越低检测越敏感
+YOLOE_SEGMENT_INTERVAL = max(1, int(os.getenv("AIGLASS_YOLOE_SEGMENT_INTERVAL", "3")))
+YOLOE_TRACK_INTERVAL = max(1, int(os.getenv("AIGLASS_YOLOE_TRACK_INTERVAL", "6")))
+YOLOE_IMGSZ = int(os.getenv("AIGLASS_YOLOE_IMGSZ", "512"))
 
 # ========= 方向引导音频路径 =========
 AUDIO_DIR = r"E:\沙粒云\自媒体\2025视频制作\20250925AI眼镜\AI眼镜合并\audio"  # 请修改为实际路径
@@ -683,6 +686,10 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
     flow_grace   = 0         # YOLOE 丢检后，允许光流顶住的计数
     last_seen_ts = 0.0       # 最近一次 YOLOE 成功检测的时间戳
     locked_id    = None      # （可选）若你在 tracker 里记录了 id，可在下面选择相同 id
+    last_yoloe_det = None
+    last_yoloe_mask = None
+    yoloe_infer_count = 0
+    last_yoloe_dt = 0.0
     # 刷新/容错参数（可按需微调）
     REDETECT_EVERY = 5       # 每 5 帧强制"信任 YOLOE 一次"
     FLOW_GRACE_MAX = 8       # YOLOE 连续丢检时，光流最多顶 8 帧
@@ -699,14 +706,34 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
     yoloe_backend = None
     if _YOLOE_READY:
         try:
+            bridge_io.set_yolo_status(running=True, phase="loading", target=PROMPT_NAME, backend="YOLOE")
             yoloe_backend = YoloEBackend()                  # 可用 YOLOE_MODEL_PATH 环境变量指定模型
+            bridge_io.set_yolo_status(
+                running=True,
+                phase="text_features",
+                target=PROMPT_NAME,
+                backend="YOLOE",
+                device=str(getattr(yoloe_backend, "device", "")),
+                model_path=str(getattr(yoloe_backend, "model_path", "")),
+            )
             yoloe_backend.set_text_classes([PROMPT_NAME])   # 文本类别
             use_yoloe = True
+            bridge_io.set_yolo_status(
+                running=True,
+                phase="ready",
+                target=PROMPT_NAME,
+                backend="YOLOE",
+                device=str(getattr(yoloe_backend, "device", "")),
+                model_path=str(getattr(yoloe_backend, "model_path", "")),
+                last_error="",
+            )
             print(f"[DETECTOR] YOLOE text-prompt backend enabled for: {PROMPT_NAME}", flush=True)
         except Exception as e:
             print(f"[DETECTOR] YOLOE init failed: {e}", flush=True)
+            bridge_io.set_yolo_status(running=False, phase="failed", target=PROMPT_NAME, last_error=str(e))
     else:
         print("[DETECTOR] YOLOE backend not ready (import failed)", flush=True)
+        bridge_io.set_yolo_status(running=False, phase="failed", target=PROMPT_NAME, last_error="YOLOE backend import failed")
 
     # 类名映射（YOLOE 模式下简化）
     if use_yoloe:
@@ -760,6 +787,8 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
     auto_lock_start_time = None  # 开始检测到物体的时间
     auto_lock_delay = 1.0        # 1秒后自动锁定
     last_detected_mask = None    # 最后检测到的mask
+    object_found_announced = False
+    search_completed = False
     
     # 添加闪烁动画相关变量
     flash_start_time = None      # 闪烁开始时间
@@ -800,9 +829,9 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
             frame = bridge_io.wait_raw_bgr(timeout_sec=0.5)
             if frame is None:
                 # 没取到帧就继续等（ESP32还没连上或暂时无新帧）
-                # [headless] 给出 1ms 让出调度，避免空转
+                # [headless] 给出 1ms 让出调度，避免空转；不调用 highgui waitKey
                 if headless:
-                    cv2.waitKey(1)
+                    time.sleep(0.001)
                 continue
             
             # 每帧重置 UI 文字叠加到左下角
@@ -856,12 +885,33 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
             if MODE == "SEGMENT":
                 # —— 仅 YOLOE：每帧文本提示分割 + 取最大目标（删掉 shoppingbest 与重复 YOLOE 段）——
                 FRAME_IDX += 1
+                if FRAME_IDX % 10 == 1:
+                    bridge_io.set_yolo_status(running=True, phase="infer", target=PROMPT_NAME, frames=FRAME_IDX)
                 candidate_masks = []
                 detected_object = False
 
                 if use_yoloe and yoloe_backend is not None:
-                    # 每帧都跑；persist=True 便于维持目标 ID
-                    det = yoloe_backend.segment(frame, conf=0.20, iou=0.45, imgsz=640, persist=True)
+                    should_infer = (last_yoloe_det is None) or (FRAME_IDX % YOLOE_SEGMENT_INTERVAL == 1)
+                    if should_infer:
+                        t0 = time.time()
+                        det = yoloe_backend.segment(frame, conf=0.20, iou=0.45, imgsz=YOLOE_IMGSZ, persist=True)
+                        last_yoloe_det = det
+                        yoloe_infer_count += 1
+                        last_yoloe_dt = time.time() - t0
+                    else:
+                        det = last_yoloe_det or {"masks": [], "boxes": [], "cls_ids": [], "names": [], "ids": []}
+
+                    bridge_io.set_yolo_status(
+                        running=True,
+                        phase="infer",
+                        target=PROMPT_NAME,
+                        frames=FRAME_IDX,
+                        inferences=yoloe_infer_count,
+                        detections=len(det.get("masks", [])),
+                        last_error="",
+                    )
+                    if should_infer and yoloe_infer_count % 10 == 0:
+                        print(f"[YOLOE] infer frame={FRAME_IDX} detections={len(det.get('masks', []))} dt={last_yoloe_dt:.3f}s", flush=True)
                     H, W = frame.shape[:2]
 
                     # 选一个掩膜：优先与 locked_id 相同；否则面积最大
@@ -904,6 +954,17 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                         # 记录 id，减少目标跳变
                         if det["ids"] and len(det["ids"]) > chosen_idx and det["ids"][chosen_idx] is not None:
                             locked_id = int(det["ids"][chosen_idx])
+                        last_yoloe_mask = mask_bin
+                    elif last_yoloe_mask is not None and not should_infer:
+                        mask_bin = last_yoloe_mask
+                        candidate_masks.append({
+                            "mask": mask_bin,
+                            "area": int(mask_bin.sum()),
+                            "name": PROMPT_NAME,
+                            "cls_id": 0,
+                            "conf": 0.99,
+                        })
+                        detected_object = True
 
                 else:
                     # YOLOE 未就绪：提示并保持原画面（不阻塞前端）
@@ -942,7 +1003,9 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                     if auto_lock_start_time is None:
                         auto_lock_start_time = t_now
                         print(f"[AUTO] 检测到物体，选择最大的（面积: {np.sum(last_detected_mask)}），开始倒计时...")
-                        #play_guidance_audio("检测到物体")  # 添加这行
+                        if not object_found_announced:
+                            play_guidance_audio("检测到物体")
+                            object_found_announced = True
                     
                     elapsed = t_now - auto_lock_start_time
                     remaining = auto_lock_delay - elapsed
@@ -987,6 +1050,7 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                     if auto_lock_start_time is not None:
                         print("[AUTO] 物体丢失，重置倒计时")
                     auto_lock_start_time = None
+                    object_found_announced = False
                     last_detected_mask = None
                     draw_text_cn(vis, "分割中... 等待检测到物体", (10, 100), font_size=16, color=FRONTEND_COLORS["muted"])
 
@@ -1075,11 +1139,24 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                                 need_reseed = False
                                 new_det_mask = None
 
-                                if use_yoloe and yoloe_backend is not None and (FRAME_IDX % 3 == 0):
+                                if use_yoloe and yoloe_backend is not None and (FRAME_IDX % YOLOE_TRACK_INTERVAL == 0):
                                     # 添加调试信息
                                     if FRAME_IDX % 30 == 0:  # 每30帧打印一次
                                         print(f"[YOLOE] 实时检测第 {FRAME_IDX} 帧")
-                                    det = yoloe_backend.segment(frame, conf=0.20, iou=0.45, imgsz=640, persist=True)
+                                    t0 = time.time()
+                                    det = yoloe_backend.segment(frame, conf=0.20, iou=0.45, imgsz=YOLOE_IMGSZ, persist=True)
+                                    yoloe_infer_count += 1
+                                    bridge_io.set_yolo_status(
+                                        running=True,
+                                        phase="infer",
+                                        target=PROMPT_NAME,
+                                        frames=FRAME_IDX,
+                                        inferences=yoloe_infer_count,
+                                        detections=len(det.get("masks", [])),
+                                        last_error="",
+                                    )
+                                    if FRAME_IDX % 30 == 0:
+                                        print(f"[YOLOE] track infer frame={FRAME_IDX} detections={len(det.get('masks', []))} dt={(time.time()-t0):.3f}s", flush=True)
                                     if det["masks"]:
                                         # 取面积最大的那个
                                         areas = [int(m.sum()) for m in det["masks"]]
@@ -1313,7 +1390,20 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                                         print(f"[YOLOE] TRACK模式实时检测第 {track_frame_count} 帧")
                                     
                                     # YOLOE 实时检测（统一调用，避免重复）
-                                    det = yoloe_backend.segment(frame, conf=YOLO_CORRECTION_CONF_THRESHOLD, iou=0.45, imgsz=640, persist=True)
+                                    t0 = time.time()
+                                    det = yoloe_backend.segment(frame, conf=YOLO_CORRECTION_CONF_THRESHOLD, iou=0.45, imgsz=YOLOE_IMGSZ, persist=True)
+                                    yoloe_infer_count += 1
+                                    bridge_io.set_yolo_status(
+                                        running=True,
+                                        phase="infer",
+                                        target=PROMPT_NAME,
+                                        frames=track_frame_count,
+                                        inferences=track_frame_count,
+                                        detections=len(det.get("masks", [])),
+                                        last_error="",
+                                    )
+                                    if track_frame_count % 30 == 0:
+                                        print(f"[YOLOE] track corr frame={track_frame_count} detections={len(det.get('masks', []))} dt={(time.time()-t0):.3f}s", flush=True)
                                     if det["masks"]:
                                         # 取面积最大的那个
                                         areas = [int(m.sum()) for m in det["masks"]]
@@ -1437,6 +1527,16 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                                 if is_touching:
                                     draw_text_cn(vis, f"状态: 已接触 ({overlap_ratio:.1%})", (10, 95), 
                                                font_size=16, color=(0, 255, 0))
+                                    if not search_completed:
+                                        play_guidance_audio("OK")
+                                        bridge_io.set_yolo_status(running=False, phase="completed", target=PROMPT_NAME)
+                                        try:
+                                            bridge_io.send_ui_final("寻物任务完成。")
+                                        except Exception:
+                                            pass
+                                        if stop_event is not None:
+                                            stop_event.set()
+                                        search_completed = True
                                 else:
                                     # 计算手和物体的距离
                                     if hand_center and poly_center:
@@ -1451,6 +1551,18 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                                     grasp_now, grasp_score = detect_grasp(l0, W, H)
                                 else:
                                     grasp_now, grasp_score = False, 0.0
+                                if grasp_now and not search_completed:
+                                    play_guidance_audio("OK")
+                                    bridge_io.set_yolo_status(running=False, phase="completed", target=PROMPT_NAME)
+                                    try:
+                                        bridge_io.send_ui_final("寻物任务完成。")
+                                    except Exception:
+                                        pass
+                                    if stop_event is not None:
+                                        stop_event.set()
+                                    search_completed = True
+                                if search_completed:
+                                    break
              
                                 # guidance_msg 相关代码已经集成到上面的引导逻辑中
 
@@ -1492,14 +1604,14 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
 
                 old_gray = gray
 
-            # FPS（移动到左下角样式）
+            # FPS
             if 'fps_hist' not in locals():
                 fps_hist = []
             fps_hist.append(t_now)
             if len(fps_hist) > 30:
                 fps_hist.pop(0)
             fps = 0.0 if len(fps_hist) < 2 else (len(fps_hist)-1)/(fps_hist[-1]-fps_hist[0])
-            draw_text_cn(vis, f"FPS: {fps:.1f}", (10, 40), font_size=16, color=FRONTEND_COLORS["ok"]) 
+            draw_text_cn(vis, f"FPS: {fps:.1f}", (10, 40), font_size=16, color=FRONTEND_COLORS["ok"], ui_hint=False)
 
             # 右下角显示"内边界/最近一次锁定"的调试图
             if lock_edge_debug is not None:
@@ -1522,7 +1634,7 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
             # 展示（无论 headless 与否，都会推给前端）
             bridge_io.send_vis_bgr(vis)
 
-            # [headless] 只有非 headless 时才弹窗与键盘交互；headless 下用 waitKey(1) 让出调度
+            # [headless] 只有非 headless 时才弹窗与键盘交互；headless 下只让出调度
             if not headless:
                 cv2.imshow(WINDOW, vis)
                 key = cv2.waitKey(1) & 0xFF
@@ -1534,7 +1646,18 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                     if MODE == "SEGMENT":
                         # 使用 YOLOE 进行手动锁定
                         if use_yoloe and yoloe_backend is not None:
+                            t0 = time.time()
                             det = yoloe_backend.segment(frame, conf=CONF_THRESHOLD, iou=0.45, imgsz=640, persist=True)
+                            bridge_io.set_yolo_status(
+                                running=True,
+                                phase="infer",
+                                target=PROMPT_NAME,
+                                frames=FRAME_IDX,
+                                inferences=FRAME_IDX,
+                                detections=len(det.get("masks", [])),
+                                last_error="",
+                            )
+                            print(f"[YOLOE] manual lock detections={len(det.get('masks', []))} dt={(time.time()-t0):.3f}s", flush=True)
                             if det["masks"]:
                                 # 取面积最大的那个
                                 areas = [int(m.sum()) for m in det["masks"]]
@@ -1563,8 +1686,7 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                         else:
                             print("[LOCK] 当前帧未找到有效分割，请重试。")
             else:
-                # headless 下也调用一次 waitKey(1)，让 OpenCV 的计时器/回调得到机会，且避免 CPU 忙等
-                cv2.waitKey(1)
+                time.sleep(0.001)
                 
                 # 在 headless 模式下检查停止事件
                 if stop_event and stop_event.is_set():

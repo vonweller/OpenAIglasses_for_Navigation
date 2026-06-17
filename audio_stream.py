@@ -41,6 +41,9 @@ class StreamClient:
 
 stream_clients: "Set[StreamClient]" = set()
 STREAM_QUEUE_MAX = 96  # 小缓冲，避免积压
+last_broadcast_at: Optional[float] = None
+last_broadcast_bytes: int = 0
+total_broadcast_bytes: int = 0
 
 def _wav_header_unknown_size(sr=16000, ch=1, sw=2) -> bytes:
     import struct
@@ -78,6 +81,13 @@ async def hard_reset_audio(reason: str = ""):
 
 async def broadcast_pcm16_realtime(pcm16: bytes):
     """以 20ms 节拍把 pcm16 发送给所有仍存活的连接；队列满丢尾，保持实时。"""
+    global last_broadcast_at, last_broadcast_bytes, total_broadcast_bytes
+    if pcm16:
+        import time
+        last_broadcast_at = time.time()
+        last_broadcast_bytes = len(pcm16)
+        total_broadcast_bytes += len(pcm16)
+
     # 【新增】录制音频（在分发之前整体录制，避免分片）
     try:
         import sync_recorder
@@ -115,6 +125,17 @@ async def broadcast_pcm16_realtime(pcm16: bytes):
         else:
             next_tick = now
         off += take
+
+
+def get_stream_status() -> Dict[str, Any]:
+    import time
+    age = None if not last_broadcast_at else max(0.0, time.time() - last_broadcast_at)
+    return {
+        "clients": len(stream_clients),
+        "last_broadcast_age_sec": age,
+        "last_broadcast_bytes": last_broadcast_bytes,
+        "total_broadcast_bytes": total_broadcast_bytes,
+    }
 
 # ===== FastAPI 路由注册器 =====
 def register_stream_route(app):

@@ -6,6 +6,10 @@
   const $asrStatus = document.getElementById('asrStatus');
   const $camStatusStage = document.getElementById('camStatusStage');
   const $audioStatusStage = document.getElementById('audioStatusStage');
+  const $yoloStatusStage = document.getElementById('yoloStatusStage');
+  const $yoloStatus = document.getElementById('yoloStatus');
+  const $modeStatus = document.getElementById('modeStatus');
+  const $speakerStatus = document.getElementById('speakerStatus');
   const $stageEmpty = document.getElementById('stageEmpty');
   const $partial   = document.getElementById('partial');
   const $finalList = document.getElementById('finalList');
@@ -68,28 +72,28 @@
       #chatContainer{
         position: relative !important;
         overflow-y: auto !important;
-        flex: 1 !important;  /* 改为使用 flex: 1 占满剩余空间 */
-        min-height: 0 !important;  /* 确保 flex 子元素能正确收缩 */
-        padding: 12px 12px 4px !important;
-        background: #0b1020 !important;
-        border: 1px solid #1d2438 !important;
-        border-radius: 10px !important;
-        margin-top: 12px !important;
+        flex: 1 !important;
+        min-height: 0 !important;
+        padding: 8px 2px 2px !important;
+        background: transparent !important;
+        border: 0 !important;
+        border-radius: 0 !important;
+        margin-top: 0 !important;
       }
       
       /* 自定义滚动条样式 */
       #chatContainer::-webkit-scrollbar {
-        width: 8px !important;
+        width: 6px !important;
       }
       
       #chatContainer::-webkit-scrollbar-track {
-        background: #0d1420 !important;
-        border-radius: 4px !important;
+        background: transparent !important;
+        border-radius: 999px !important;
       }
       
       #chatContainer::-webkit-scrollbar-thumb {
         background: #2a3446 !important;
-        border-radius: 4px !important;
+        border-radius: 999px !important;
         transition: background 0.2s !important;
       }
       
@@ -104,22 +108,22 @@
       }
       .timestamp{
         text-align:center !important;
-        font-size:12px !important;
+        font-size:11px !important;
         color:#8a93a5 !important;
-        margin:10px 0 !important;
+        margin:8px 0 !important;
         user-select:none !important;
       }
       .message{
         display:flex !important;
         gap:8px !important;
-        margin:6px 0 !important;
+        margin:8px 0 !important;
         align-items:flex-end !important;
       }
       .message.ai{ justify-content:flex-start !important; }
       .message.user{ justify-content:flex-end !important; }
 
       .avatar{
-        width:28px !important; height:28px !important; border-radius:50% !important;
+        width:26px !important; height:26px !important; border-radius:50% !important;
         background:#232a3d !important; flex:0 0 28px !important;
         display:flex !important; align-items:center !important; justify-content:center !important;
         color:#9fb0c3 !important; font-size:12px !important; user-select:none !important;
@@ -128,27 +132,27 @@
       .message.user .avatar{ display:none !important; }
 
       .bubble{
-        max-width: 72% !important;
+        max-width: 86% !important;
         padding:10px 12px !important;
-        line-height:1.45 !important;
-        border-radius:14px !important;
+        line-height:1.5 !important;
+        border-radius:10px !important;
         word-break:break-word !important;
         white-space:pre-wrap !important;
         border:1px solid transparent !important;
-        box-shadow:0 2px 8px rgba(0,0,0,0.15) !important;
+        box-shadow:0 6px 18px rgba(0,0,0,0.18) !important;
         font-size:14px !important;
       }
       .message.ai .bubble{
-        background:#111a2e !important;
+        background:#101a28 !important;
         color:#e6edf3 !important;
         border-color:#1e2740 !important;
-        border-top-left-radius:6px !important;
+        border-top-left-radius:4px !important;
       }
       .message.user .bubble{
         background:#2a6df4 !important;
         color:#fff !important;
         border-color:#2a6df4 !important;
-        border-top-right-radius:6px !important;
+        border-top-right-radius:4px !important;
       }
     `;
     document.head.appendChild(s);
@@ -221,6 +225,53 @@
     if (!el) return;
     el.textContent = text;
     el.className = 'badge ' + (tone || (ok ? 'ok' : 'err'));
+  }
+
+  function updateYoloBadge(data){
+    const yolo = data?.yolo || {};
+    const phase = yolo.phase || 'idle';
+    const target = yolo.target ? ` ${yolo.target}` : '';
+    const device = yolo.device ? ` / ${yolo.device}` : '';
+    const detections = Number.isFinite(Number(yolo.detections)) ? ` det:${Number(yolo.detections)}` : '';
+    const err = yolo.last_error || '';
+    let tone = 'warn';
+    let text = `YOLO: ${phase}${target}${device}${detections}`;
+    if (phase === 'idle' || phase === 'stopped') {
+      tone = '';
+      text = 'YOLO: idle';
+    } else if (phase === 'failed') {
+      tone = 'err';
+      text = `YOLO error: ${err ? err.slice(0, 48) : 'failed'}`;
+    } else if (phase === 'infer' || phase === 'ready') {
+      tone = 'ok';
+    }
+    setBadge($yoloStatusStage, tone === 'ok', text, tone);
+    setBadge($yoloStatus, tone === 'ok', text, tone);
+  }
+
+  function updateModeAndSpeaker(data){
+    const mode = data?.item_search_running ? 'ITEM_SEARCH' : (data?.mode || 'CHAT');
+    const modeTone = mode === 'CHAT' || mode === 'IDLE' ? '' : 'warn';
+    setBadge($modeStatus, modeTone !== 'warn', `Mode: ${mode}`, modeTone);
+
+    const stream = data?.audio_stream || {};
+    const clients = Number(stream.clients || 0);
+    const age = stream.last_broadcast_age_sec;
+    let text = clients > 0 ? `Speaker: connected (${clients})` : 'Speaker: no listener';
+    let tone = clients > 0 ? 'ok' : 'warn';
+    if (age !== null && age !== undefined && Number.isFinite(Number(age)) && Number(age) < 3) {
+      text += ' playing';
+    }
+    setBadge($speakerStatus, clients > 0, text, tone);
+  }
+
+  function asrErrorLabel(raw){
+    const text = String(raw || '');
+    if (!text) return '';
+    if (text.includes('ResponseTimeout')) return 'ASR timeout: reconnecting';
+    if (text.includes('NO_API_KEY') || text.includes('missing DASHSCOPE_API_KEY')) return 'ASR error: API Key missing';
+    if (text.includes('START_FAILED') || text.includes('recognition start failed')) return 'ASR error: start failed';
+    return `ASR error: ${text.slice(0, 42)}`;
   }
 
   function navLabelAndText(raw) {
@@ -458,14 +509,26 @@
         }
       }
 
-      if (data.audio_connected) {
-        setBadge($audioStatusStage, true, 'Audio HW: connected');
+      if (data.audio_connected && data.asr_streaming) {
+        const chunks = Number(data.asr_audio_chunks || 0);
+        setBadge($audioStatusStage, true, `ASR: streaming (${chunks})`);
+      } else if (data.audio_connected) {
+        setBadge($audioStatusStage, true, 'Audio HW: connected / ASR off');
       } else {
         setBadge($audioStatusStage, false, 'Audio HW: waiting', 'warn');
       }
+      if (data.asr_last_error) {
+        setBadge($audioStatusStage, false, asrErrorLabel(data.asr_last_error), 'err');
+      }
+      updateModeAndSpeaker(data);
+      updateYoloBadge(data);
     } catch (e) {
       setBadge($camStatusStage, false, 'Camera HW: unknown');
       setBadge($audioStatusStage, false, 'Audio HW: unknown');
+      setBadge($modeStatus, false, 'Mode: unknown', 'warn');
+      setBadge($speakerStatus, false, 'Speaker: unknown', 'warn');
+      setBadge($yoloStatusStage, false, 'YOLO: unknown', 'warn');
+      setBadge($yoloStatus, false, 'YOLO: unknown', 'warn');
     }
   }
 

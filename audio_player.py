@@ -129,6 +129,17 @@ def _merge_voice_map():
                 added += 1
             else:
                 print(f"[AUDIO] 映射文件缺失: {fpath}")
+        aliases = {
+            "检测到物体": "目标就在前方，请慢慢靠近。",
+            "向左": "请向左平移。",
+            "向右": "请向右平移。",
+            "向前": "已到达目标前方，请注意。",
+            "OK": "已到达目标前方，请注意。",
+            "拿到物体": "寻物任务完成。",
+        }
+        for old_key, new_key in aliases.items():
+            if new_key in AUDIO_MAP:
+                AUDIO_MAP[old_key] = AUDIO_MAP[new_key]
         print(f"[AUDIO] 已合并 voice 映射 {added} 条")
     except Exception as e:
         print(f"[AUDIO] 读取 voice 映射失败: {e}")

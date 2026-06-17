@@ -59,6 +59,8 @@ rebuild1002/
 │       ├── trafficlight.pt            # 红绿灯检测模型
 │       └── hand_landmarker.task       # MediaPipe 手部模型
 │
+├── mobileclip_blt.ts                  # YOLOE 文本提示特征文件（根目录）
+│
 ├── 📹 录制文件
 │   └── recordings/                    # 自动保存的视频和音频
 │       ├── video_*.avi

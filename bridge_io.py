@@ -19,6 +19,22 @@ _sender_cb = None
 _ui_sender_lock = threading.Lock()
 _ui_sender_cb = None
 
+_yolo_status_lock = threading.Lock()
+_yolo_status = {
+    "running": False,
+    "phase": "idle",
+    "target": "",
+    "backend": "",
+    "device": "",
+    "model_path": "",
+    "frames": 0,
+    "inferences": 0,
+    "detections": 0,
+    "last_error": "",
+    "started_at": None,
+    "updated_at": None,
+}
+
 def set_sender(cb):
     """由 app_main.py 调用，注册一个函数：cb(jpeg_bytes)->None"""
     global _sender_cb
@@ -30,6 +46,16 @@ def set_ui_sender(cb):
     global _ui_sender_cb
     with _ui_sender_lock:
         _ui_sender_cb = cb
+
+def set_yolo_status(**kwargs):
+    """Thread-safe status channel for item-search/YOLO diagnostics."""
+    with _yolo_status_lock:
+        _yolo_status.update(kwargs)
+        _yolo_status["updated_at"] = time.time()
+
+def get_yolo_status():
+    with _yolo_status_lock:
+        return dict(_yolo_status)
 
 def push_raw_jpeg(jpeg_bytes: bytes):
     """由 app_main.py 在收到 /ws/camera 帧时调用"""

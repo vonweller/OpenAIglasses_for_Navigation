@@ -95,6 +95,7 @@ from audio_stream import (
     BYTES_PER_20MS_16K,
     is_playing_now,
     current_ai_task,
+    get_stream_status,
 )
 from omni_client import stream_chat, OmniStreamPiece
 from asr_core import (
@@ -128,6 +129,17 @@ camera_viewers: Set[WebSocket] = set()
 esp32_camera_ws: Optional[WebSocket] = None
 imu_ws_clients: Set[WebSocket] = set()
 esp32_audio_ws: Optional[WebSocket] = None
+asr_diag: Dict[str, Any] = {
+    "audio_ws_connected": False,
+    "streaming": False,
+    "started_at": None,
+    "last_audio_at": None,
+    "audio_chunks": 0,
+    "last_command": "",
+    "last_error": "",
+    "last_partial_at": None,
+    "last_final_at": None,
+}
 
 # 【新增】盲道导航相关全局变量
 blind_path_navigator = None
@@ -277,11 +289,14 @@ async def ui_broadcast_raw(msg: str):
 async def ui_broadcast_partial(text: str):
     global current_partial
     current_partial = text
+    if text:
+        _set_asr_diag(last_partial_at=time.time())
     await ui_broadcast_raw("PARTIAL:" + text)
 
 async def ui_broadcast_final(text: str):
     global current_partial, recent_finals
     current_partial = ""
+    _set_asr_diag(last_final_at=time.time())
     recent_finals.append(text)
     if len(recent_finals) > RECENT_MAX:
         recent_finals = recent_finals[-RECENT_MAX:]
@@ -336,6 +351,17 @@ def start_yolomedia_with_target(target_name: str):
     yolo_class = ITEM_TO_CLASS_MAP.get(target_name, target_name)
     print(f"[YOLOMEDIA] Starting with target: {target_name} -> YOLO class: {yolo_class}", flush=True)
     print(f"[YOLOMEDIA] Available mappings: {ITEM_TO_CLASS_MAP}", flush=True)  # 添加这行调试
+    bridge_io.set_yolo_status(
+        running=True,
+        phase="starting",
+        target=yolo_class,
+        backend="YOLOE",
+        frames=0,
+        inferences=0,
+        detections=0,
+        last_error="",
+        started_at=time.time(),
+    )
     
     yolomedia_stop_event.clear()
     yolomedia_running = True
@@ -347,10 +373,22 @@ def start_yolomedia_with_target(target_name: str):
             yolomedia.main(headless=True, prompt_name=yolo_class, stop_event=yolomedia_stop_event)
         except Exception as e:
             print(f"[YOLOMEDIA] worker stopped: {e}", flush=True)
+            bridge_io.set_yolo_status(running=False, phase="failed", last_error=str(e))
         finally:
             global yolomedia_running, yolomedia_sending_frames
             yolomedia_running = False
             yolomedia_sending_frames = False
+            status = bridge_io.get_yolo_status()
+            if status.get("phase") == "completed":
+                if orchestrator:
+                    try:
+                        orchestrator.stop_item_search(restore_nav=True)
+                        print(f"[ITEM_SEARCH] completed by vision, state={orchestrator.get_state()}", flush=True)
+                    except Exception as exc:
+                        print(f"[ITEM_SEARCH] completed state restore failed: {exc}", flush=True)
+                bridge_io.set_yolo_status(running=False, phase="completed")
+            elif status.get("phase") != "failed":
+                bridge_io.set_yolo_status(running=False, phase="stopped")
     
     yolomedia_thread = threading.Thread(target=_run, daemon=True)
     yolomedia_thread.start()
@@ -370,6 +408,7 @@ def stop_yolomedia():
         
         yolomedia_running = False
         yolomedia_sending_frames = False
+        bridge_io.set_yolo_status(running=False, phase="stopping")
         
         # 【新增】如果orchestrator在找物品模式，结束时不自动恢复（由命令控制）
         # 只清理标志位即可
@@ -379,6 +418,21 @@ def stop_yolomedia():
 async def start_ai_with_text_custom(user_text: str):
     """扩展版的AI启动函数，支持识别特殊命令"""
     global navigation_active, blind_path_navigator, cross_street_active, cross_street_navigator, orchestrator
+
+    if "找到了" in user_text or "拿到了" in user_text or "收到" in user_text:
+        print("[ITEM_SEARCH] Found/received command detected", flush=True)
+        stop_yolomedia()
+        if orchestrator:
+            orchestrator.stop_item_search(restore_nav=True)
+            current_state = orchestrator.get_state()
+            print(f"[ITEM_SEARCH] 找物品结束，当前状态: {current_state}")
+            if current_state in ["BLINDPATH_NAV", "SEEKING_CROSSWALK", "WAIT_TRAFFIC_LIGHT", "CROSSING", "SEEKING_NEXT_BLINDPATH"]:
+                await ui_broadcast_final("[找物品] 已找到物品，继续导航。")
+            else:
+                await ui_broadcast_final("[找物品] 已找到物品。")
+        else:
+            await ui_broadcast_final("[找物品] 已找到物品。")
+        return
     
     # 【修改】在导航模式和红绿灯检测模式下，只有特定词才进入omni对话
     if orchestrator:
@@ -502,12 +556,12 @@ async def start_ai_with_text_custom(user_text: str):
 
     # 检查是否是"帮我找/识别一下xxx"的命令
     # 扩展正则表达式，支持更多关键词
-    find_pattern = r"(?:^\s*帮我)?\s*找一下\s*(.+?)(?:。|！|？|$)"
+    find_pattern = r"(?:^\s*(?:帮我|请|麻烦)?\s*(?:找一下|找一找|找一个|找找|寻找|搜索|识别一下|检测一下|找)\s*(.+?)(?:在哪里|在哪儿|在哪|哪里|的位置)?(?:。|！|？|\?|$))|(?:^\s*(.+?)(?:在哪里|在哪儿|在哪|哪里|的位置)(?:。|！|？|\?|$))"
     match = re.search(find_pattern, user_text)
         
     if match:
         # 提取中文物品名称
-        item_cn = match.group(1).strip()
+        item_cn = (match.group(1) or match.group(2) or "").strip()
         if item_cn:
             # 【新增】用本地映射 + Qwen 提取英文类名
             label_en, src = extract_english_label(item_cn)
@@ -528,28 +582,6 @@ async def start_ai_with_text_custom(user_text: str):
                 pass
 
             return
-    
-    # 检查是否是"找到了"的命令
-    if "找到了" in user_text or "拿到了" in user_text:
-        print("[COMMAND] Found command detected", flush=True)
-        # 停止yolomedia
-        stop_yolomedia()
-        
-        # 【新增】停止找物品模式，恢复之前的导航状态
-        if orchestrator:
-            orchestrator.stop_item_search(restore_nav=True)
-            current_state = orchestrator.get_state()
-            print(f"[ITEM_SEARCH] 找物品结束，当前状态: {current_state}")
-            
-            # 根据恢复的状态给出反馈
-            if current_state in ["BLINDPATH_NAV", "SEEKING_CROSSWALK", "WAIT_TRAFFIC_LIGHT", "CROSSING", "SEEKING_NEXT_BLINDPATH"]:
-                await ui_broadcast_final("[找物品] 已找到物品，继续导航。")
-            else:
-                await ui_broadcast_final("[找物品] 已找到物品。")
-        else:
-            await ui_broadcast_final("[找物品] 已找到物品。")
-        
-        return
     
     # 【修改】omni对话开始时，切换到CHAT模式
     global omni_conversation_active, omni_previous_nav_state
@@ -689,6 +721,12 @@ def device_status():
             last_frame_age = max(0.0, time.time() - last_frames[-1][0])
         except Exception:
             last_frame_age = None
+    mode = "CHAT"
+    if orchestrator:
+        try:
+            mode = orchestrator.get_state()
+        except Exception:
+            mode = "UNKNOWN"
 
     return {
         "camera_connected": _ws_connected(esp32_camera_ws),
@@ -696,6 +734,31 @@ def device_status():
         "viewer_count": len(camera_viewers),
         "imu_viewer_count": len(imu_ws_clients),
         "last_frame_age_sec": last_frame_age,
+        "asr_streaming": bool(asr_diag.get("streaming")),
+        "asr_audio_chunks": int(asr_diag.get("audio_chunks") or 0),
+        "asr_last_error": asr_diag.get("last_error") or "",
+        "mode": mode,
+        "item_search_running": bool(yolomedia_running),
+        "audio_stream": get_stream_status(),
+        "yolo": bridge_io.get_yolo_status(),
+    }
+
+@app.get("/api/asr-status")
+def asr_status():
+    now = time.time()
+    def age(ts):
+        return None if not ts else max(0.0, now - float(ts))
+    return {
+        "api_key_configured": bool(API_KEY),
+        "audio_ws_connected": bool(asr_diag.get("audio_ws_connected")),
+        "streaming": bool(asr_diag.get("streaming")),
+        "audio_chunks": int(asr_diag.get("audio_chunks") or 0),
+        "started_age_sec": age(asr_diag.get("started_at")),
+        "last_audio_age_sec": age(asr_diag.get("last_audio_at")),
+        "last_partial_age_sec": age(asr_diag.get("last_partial_at")),
+        "last_final_age_sec": age(asr_diag.get("last_final_at")),
+        "last_command": asr_diag.get("last_command") or "",
+        "last_error": asr_diag.get("last_error") or "",
     }
 
 def _local_ipv4s() -> List[str]:
@@ -744,6 +807,9 @@ def _mask_key(key: str) -> str:
     if len(key) <= 8:
         return "*" * len(key)
     return f"{key[:3]}***{key[-4:]}"
+
+def _set_asr_diag(**kwargs) -> None:
+    asr_diag.update(kwargs)
 
 def _persist_env_value(key: str, value: str) -> None:
     if not key or not value:
@@ -891,6 +957,7 @@ async def ws_audio(ws: WebSocket):
     global esp32_audio_ws
     esp32_audio_ws = ws
     await ws.accept()
+    _set_asr_diag(audio_ws_connected=True, streaming=False, last_error="")
     print("\n[AUDIO] client connected")
     recognition = None
     streaming = False
@@ -910,11 +977,14 @@ async def ws_audio(ws: WebSocket):
             recognition = None
         await set_current_recognition(None)
         streaming = False
+        _set_asr_diag(streaming=False)
         if send_notice:
             try: await ws.send_text(send_notice)
             except Exception: pass
 
     async def on_sdk_error(_msg: str):
+        print(f"[ASR ERROR] {_msg}", flush=True)
+        _set_asr_diag(last_error=str(_msg), streaming=False)
         await stop_rec(send_notice="RESTART")
 
     async def keepalive_loop():
@@ -953,6 +1023,13 @@ async def ws_audio(ws: WebSocket):
 
                 if cmd == "START":
                     print("[AUDIO] START received")
+                    _set_asr_diag(last_command="START", last_error="", audio_chunks=0)
+                    if not API_KEY:
+                        msg = "missing DASHSCOPE_API_KEY"
+                        print(f"[ASR ERROR] {msg}", flush=True)
+                        _set_asr_diag(last_error=msg, streaming=False)
+                        await ws.send_text("ERR:NO_API_KEY")
+                        continue
                     await stop_rec()
                     loop = asyncio.get_running_loop()
                     def post(coro):
@@ -970,19 +1047,30 @@ async def ws_audio(ws: WebSocket):
                         interrupt_lock=interrupt_lock,
                     )
 
-                    recognition = dash_audio.asr.Recognition(
-                        api_key=API_KEY, model=MODEL, format=AUDIO_FMT,
-                        sample_rate=SAMPLE_RATE, callback=cb
-                    )
-                    recognition.start()
+                    try:
+                        recognition = dash_audio.asr.Recognition(
+                            api_key=API_KEY, model=MODEL, format=AUDIO_FMT,
+                            sample_rate=SAMPLE_RATE, callback=cb
+                        )
+                        recognition.start()
+                    except Exception as exc:
+                        msg = f"recognition start failed: {exc}"
+                        print(f"[ASR ERROR] {msg}", flush=True)
+                        _set_asr_diag(last_error=msg, streaming=False)
+                        recognition = None
+                        await ws.send_text("ERR:START_FAILED")
+                        continue
                     await set_current_recognition(recognition)
                     streaming = True
                     last_ts = time.monotonic()
+                    _set_asr_diag(streaming=True, started_at=time.time(), last_audio_at=None, audio_chunks=0, last_error="")
                     keepalive_task = asyncio.create_task(keepalive_loop())
                     await ui_broadcast_partial("（已开始接收音频…）")
                     await ws.send_text("OK:STARTED")
 
                 elif cmd == "STOP":
+                    print("[AUDIO] STOP received", flush=True)
+                    _set_asr_diag(last_command="STOP")
                     if recognition:
                         for _ in range(15):  # ~300ms 静音
                             try: recognition.send_audio_frame(SILENCE_20MS)
@@ -1004,6 +1092,10 @@ async def ws_audio(ws: WebSocket):
                     try:
                         recognition.send_audio_frame(msg["bytes"])
                         last_ts = time.monotonic()
+                        chunks = int(asr_diag.get("audio_chunks") or 0) + 1
+                        if chunks % 250 == 0:
+                            print(f"[AUDIO] ASR received {chunks} chunks", flush=True)
+                        _set_asr_diag(audio_chunks=chunks, last_audio_at=time.time())
                     except Exception:
                         await on_sdk_error("send_audio_frame failed")
 
@@ -1018,6 +1110,7 @@ async def ws_audio(ws: WebSocket):
             pass
         if esp32_audio_ws is ws:
             esp32_audio_ws = None
+        _set_asr_diag(audio_ws_connected=False, streaming=False)
         print("[WS] connection closed")
 
 # ---------- WebSocket：ESP32 相机入口（JPEG 二进制） ----------
@@ -1044,6 +1137,10 @@ async def ws_camera_esp(ws: WebSocket):
     # 【新增】初始化过马路导航器
     if cross_street_navigator is None:
         if yolo_seg_model:
+            # CrossStreetNavigator defaults to auto-loading the YOLOE obstacle detector
+            # when obs_model is None. Keep it off here so camera connect never blocks on
+            # the large MobileCLIP text-feature download.
+            os.environ.setdefault("AIGLASS_OBS_AUTO", "0")
             cross_street_navigator = CrossStreetNavigator(
                 seg_model=yolo_seg_model,
                 coco_model=None,  # 不使用交通灯检测

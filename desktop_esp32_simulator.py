@@ -31,11 +31,26 @@ AUDIO_SAMPLE_RATE = 16000
 AUDIO_CHUNK_MS = 20
 AUDIO_FRAMES_PER_CHUNK = AUDIO_SAMPLE_RATE * AUDIO_CHUNK_MS // 1000
 AUDIO_BYTES_PER_CHUNK = AUDIO_FRAMES_PER_CHUNK * 2
+STREAM_SAMPLE_RATE = 8000
 
 
 def log(channel: str, message: str) -> None:
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] [{channel}] {message}", flush=True)
+
+
+class SharedFlag:
+    def __init__(self, value: bool = False):
+        self._value = value
+        self._lock = threading.Lock()
+
+    def set(self, value: bool) -> None:
+        with self._lock:
+            self._value = bool(value)
+
+    def get(self) -> bool:
+        with self._lock:
+            return self._value
 
 
 @dataclass
@@ -245,16 +260,47 @@ async def audio_sender(
 
     uri = f"ws://{args.host}:{args.port}/ws_audio"
     retry_delay = 2.0
+    restart_requested = False
+
+    async def log_ws_replies(ws) -> None:
+        nonlocal restart_requested
+        try:
+            async for reply in ws:
+                if isinstance(reply, str):
+                    log("AUDIO", f"server reply: {reply}")
+                    if reply.strip().upper() == "RESTART":
+                        restart_requested = True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not stop_event.is_set():
+                log("AUDIO", f"server reply reader stopped: {exc}")
 
     while not stop_event.is_set():
         audio_input = None
         streaming = False
+        reply_task = None
         try:
             log("AUDIO", f"connecting {uri}")
             async with websockets.connect(uri, max_size=None) as ws:
                 log("AUDIO", "connected; waiting for microphone switch")
+                reply_task = asyncio.create_task(log_ws_replies(ws))
                 sent = 0
                 while not stop_event.is_set():
+                    if restart_requested:
+                        restart_requested = False
+                        log("AUDIO", "server requested ASR restart; reopening microphone stream")
+                        if streaming:
+                            with contextlib.suppress(Exception):
+                                await ws.send("STOP")
+                            streaming = False
+                        if audio_input is not None:
+                            _, _, close_audio = audio_input
+                            close_audio()
+                            audio_input = None
+                        await asyncio.sleep(0.2)
+                        continue
+
                     if not audio_enabled_event.is_set():
                         if streaming:
                             log("AUDIO", "switch OFF; sending STOP")
@@ -299,6 +345,10 @@ async def audio_sender(
                 log("AUDIO", f"disconnected/error: {exc}; reconnecting in {retry_delay:.1f}s")
                 await asyncio.sleep(retry_delay)
         finally:
+            if reply_task is not None:
+                reply_task.cancel()
+                with contextlib.suppress(Exception):
+                    await reply_task
             if audio_input is not None:
                 _, _, close_audio = audio_input
                 close_audio()
@@ -335,6 +385,122 @@ async def imu_udp_sender(args: argparse.Namespace, state: ImuState, stop_event: 
         log("IMU", "stopped")
 
 
+def _pcm16_to_float32(pcm: bytes) -> "numpy.ndarray":
+    import numpy as np
+
+    data = np.frombuffer(pcm, dtype=np.int16)
+    if data.size == 0:
+        return data.astype(np.float32)
+    return (data.astype(np.float32) / 32768.0).copy()
+
+
+def _resample_to_44100(pcm16: bytes, src_rate: int) -> bytes:
+    import numpy as np
+
+    if not pcm16:
+        return b""
+    data = np.frombuffer(pcm16, dtype=np.int16)
+    if data.size == 0:
+        return b""
+    if src_rate == 44100:
+        return pcm16
+    duration = data.size / float(src_rate)
+    src_x = np.linspace(0.0, duration, num=data.size, endpoint=False)
+    dst_count = max(1, int(duration * 44100))
+    dst_x = np.linspace(0.0, duration, num=dst_count, endpoint=False)
+    resampled = np.interp(dst_x, src_x, data.astype(np.float32)).astype(np.int16)
+    return resampled.tobytes()
+
+
+def open_stream_player() -> Optional[Tuple[Callable[[bytes], None], Callable[[], None]]]:
+    try:
+        import sounddevice as sd
+    except Exception as exc:
+        log("STREAM", f"sounddevice import failed for playback: {exc}")
+        return None
+
+    stream = None
+    try:
+        stream = sd.RawOutputStream(
+            samplerate=44100,
+            channels=1,
+            dtype="int16",
+            blocksize=1024,
+        )
+        stream.start()
+
+        def play_pcm16(pcm16: bytes) -> None:
+            if not pcm16:
+                return
+            stream.write(_resample_to_44100(pcm16, STREAM_SAMPLE_RATE))
+
+        def close_player() -> None:
+            with contextlib.suppress(Exception):
+                stream.stop()
+            with contextlib.suppress(Exception):
+                stream.close()
+
+        return play_pcm16, close_player
+    except Exception as exc:
+        log("STREAM", f"sounddevice playback open failed: {exc}")
+        if stream is not None:
+            with contextlib.suppress(Exception):
+                stream.close()
+        return None
+
+
+async def stream_wav_player(args: argparse.Namespace, stop_event: threading.Event, enabled_event: threading.Event) -> None:
+    try:
+        import urllib.request
+    except Exception as exc:
+        log("STREAM", f"urllib import failed; playback disabled: {exc}")
+        return
+
+    uri = f"http://{args.host}:{args.port}/stream.wav"
+    retry_delay = 2.0
+
+    while not stop_event.is_set():
+        player = None
+        try:
+            while not enabled_event.is_set() and not stop_event.is_set():
+                await asyncio.sleep(0.2)
+            if stop_event.is_set():
+                break
+            log("STREAM", f"connecting {uri}")
+            response = await asyncio.to_thread(urllib.request.urlopen, uri, timeout=10)
+            log("STREAM", "connected")
+            header = await asyncio.to_thread(response.read, 44)
+            if not header.startswith(b"RIFF"):
+                log("STREAM", "unexpected stream header; continuing anyway")
+            player = open_stream_player()
+            if player is None:
+                log("STREAM", "output device unavailable; playback disabled")
+                return
+            play_pcm16, close_player = player
+            while not stop_event.is_set() and enabled_event.is_set():
+                chunk = await asyncio.to_thread(response.read, 4096)
+                if not chunk:
+                    break
+                await asyncio.to_thread(play_pcm16, chunk)
+            with contextlib.suppress(Exception):
+                response.close()
+            close_player()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            if not stop_event.is_set():
+                log("STREAM", f"disconnected/error: {exc}; reconnecting in {retry_delay:.1f}s")
+                await asyncio.sleep(retry_delay)
+        finally:
+            if player is not None:
+                _, close_player = player
+                with contextlib.suppress(Exception):
+                    close_player()
+        await asyncio.sleep(0.2)
+
+    log("STREAM", "stopped")
+
+
 async def run_async(args: argparse.Namespace, state: ImuState, stop_event: threading.Event) -> None:
     tasks = []
     if not args.no_camera:
@@ -343,6 +509,8 @@ async def run_async(args: argparse.Namespace, state: ImuState, stop_event: threa
         tasks.append(asyncio.create_task(audio_sender(args, stop_event, args.audio_enabled_event)))
     if not args.no_imu:
         tasks.append(asyncio.create_task(imu_udp_sender(args, state, stop_event)))
+    if not args.no_playback:
+        tasks.append(asyncio.create_task(stream_wav_player(args, stop_event, args.playback_enabled_event)))
 
     if not tasks:
         log("MAIN", "all channels are disabled; nothing to run")
@@ -364,6 +532,7 @@ class ImuControlWindow:
         state: ImuState,
         stop_event: threading.Event,
         audio_enabled_event: threading.Event,
+        playback_enabled_event: threading.Event,
     ):
         import tkinter as tk
         from tkinter import ttk
@@ -374,16 +543,20 @@ class ImuControlWindow:
         self.state = state
         self.stop_event = stop_event
         self.audio_enabled_event = audio_enabled_event
+        self.playback_enabled_event = playback_enabled_event
         self.root = tk.Tk()
         self.root.title("Desktop ESP32 Simulator - IMU")
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.vars: Dict[str, tk.DoubleVar] = {}
         self.audio_var = tk.BooleanVar(value=audio_enabled_event.is_set())
+        self.playback_var = tk.BooleanVar(value=playback_enabled_event.is_set())
         self.audio_status_var = tk.StringVar(value="")
+        self.playback_status_var = tk.StringVar(value="")
 
         self._build()
         self._apply_values({"ax": 0.0, "ay": 9.807, "az": 0.0, "gx": 0.0, "gy": 0.0, "gz": 0.0})
         self._sync_audio_status()
+        self._sync_playback_status()
 
     def _build(self) -> None:
         root = self.root
@@ -440,8 +613,23 @@ class ImuControlWindow:
         if self.args.no_audio:
             self.audio_toggle.state(["disabled"])
 
+        playback_box = ttk.LabelFrame(frame, text="Playback", padding=8)
+        playback_box.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        playback_box.columnconfigure(1, weight=1)
+
+        self.playback_toggle = ttk.Checkbutton(
+            playback_box,
+            text="Play backend speech",
+            variable=self.playback_var,
+            command=self.toggle_playback,
+        )
+        self.playback_toggle.grid(row=0, column=0, sticky="w")
+        ttk.Label(playback_box, textvariable=self.playback_status_var).grid(row=0, column=1, sticky="w", padx=(12, 0))
+        if self.args.no_playback:
+            self.playback_toggle.state(["disabled"])
+
         presets = ttk.LabelFrame(frame, text="Presets", padding=8)
-        presets.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        presets.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(12, 0))
         for col in range(5):
             presets.columnconfigure(col, weight=1)
 
@@ -452,7 +640,7 @@ class ImuControlWindow:
         ttk.Button(presets, text="Wiggle", command=self.preset_wiggle).grid(row=0, column=4, sticky="ew", padx=3)
 
         status = ttk.Label(frame, text="Close this window or press Ctrl+C in the terminal to stop.")
-        status.grid(row=9, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        status.grid(row=10, column=0, columnspan=4, sticky="w", pady=(10, 0))
 
     def _sync_audio_status(self) -> None:
         if self.args.no_audio:
@@ -463,12 +651,27 @@ class ImuControlWindow:
         else:
             self.audio_status_var.set("OFF: ASR stream stopped")
 
+    def _sync_playback_status(self) -> None:
+        if self.args.no_playback:
+            self.playback_status_var.set("disabled")
+        elif self.playback_enabled_event.is_set():
+            self.playback_status_var.set("ON: playing /stream.wav")
+        else:
+            self.playback_status_var.set("OFF: speech muted")
+
     def toggle_audio(self) -> None:
         if self.audio_var.get():
             self.audio_enabled_event.set()
         else:
             self.audio_enabled_event.clear()
         self._sync_audio_status()
+
+    def toggle_playback(self) -> None:
+        if self.playback_var.get():
+            self.playback_enabled_event.set()
+        else:
+            self.playback_enabled_event.clear()
+        self._sync_playback_status()
 
     def _apply_values(self, values: Dict[str, float], wiggle_seconds: float = 0.0) -> None:
         for key, value in values.items():
@@ -497,6 +700,7 @@ class ImuControlWindow:
 
     def close(self) -> None:
         self.audio_enabled_event.clear()
+        self.playback_enabled_event.clear()
         self.stop_event.set()
         self.root.after(50, self.root.destroy)
 
@@ -520,7 +724,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=15.0, help="Camera frame rate")
     parser.add_argument("--jpeg-quality", type=int, default=80, help="JPEG quality 1-100")
     parser.add_argument("--no-audio", action="store_true", help="Disable microphone simulation")
-    parser.add_argument("--audio-on-start", action="store_true", help="Start microphone stream immediately")
+    parser.add_argument("--no-playback", action="store_true", help="Disable backend speech playback")
+    parser.add_argument(
+        "--audio-on-start",
+        action="store_true",
+        help="Start microphone stream immediately (default when audio is enabled)",
+    )
     parser.add_argument("--no-camera", action="store_true", help="Disable camera simulation")
     parser.add_argument("--no-imu", action="store_true", help="Disable IMU UDP simulation")
     args = parser.parse_args(argv)
@@ -531,19 +740,24 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
-    if args.no_camera and args.no_audio and args.no_imu:
+    if args.no_camera and args.no_audio and args.no_imu and args.no_playback:
         log("MAIN", "all channels are disabled; nothing to run")
         return 0
 
     state = ImuState()
     stop_event = threading.Event()
     audio_enabled_event = threading.Event()
+    playback_enabled_event = threading.Event()
     args.audio_enabled_event = audio_enabled_event
-    if not args.no_audio and (args.audio_on_start or args.no_imu):
+    args.playback_enabled_event = playback_enabled_event
+    if not args.no_audio:
         audio_enabled_event.set()
+    if not args.no_playback:
+        playback_enabled_event.set()
 
     log("MAIN", f"camera ws: ws://{args.host}:{args.port}/ws/camera")
     log("MAIN", f"audio  ws: ws://{args.host}:{args.port}/ws_audio")
+    log("MAIN", f"playback: http://{args.host}:{args.port}/stream.wav")
     log("MAIN", f"imu   udp: {args.host}:{IMU_UDP_PORT}")
 
     loop_thread = threading.Thread(
@@ -559,7 +773,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 time.sleep(0.2)
         else:
             try:
-                window = ImuControlWindow(args, state, stop_event, audio_enabled_event)
+                window = ImuControlWindow(args, state, stop_event, audio_enabled_event, playback_enabled_event)
                 window.run()
             except Exception as exc:
                 log("IMU", f"Tkinter window failed; IMU still sends default values: {exc}")

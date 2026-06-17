@@ -2,13 +2,32 @@
 
 <div align="center">
 
-一个面向视障人士的智能导航与辅助系统，集成了盲道导航、过马路辅助、物品识别、实时语音交互等功能。  本项目仅为交流学习使用，请勿直接给视障人群使用。本项目内仅包含代码，模型地址：https://www.modelscope.cn/models/archifancy/AIGlasses_for_navigation  。下载后存放在/model 文件夹
+一个面向视障人士的智能导航与辅助系统，集成了盲道导航、过马路辅助、物品识别、实时语音交互等功能。  本项目仅为交流学习使用，请勿直接给视障人群使用。本项目内仅包含代码，模型地址：https://www.modelscope.cn/models/archifancy/AIGlasses_for_navigation  。请按下文的安装脚本或 `python prepare_models.py` 自动下载并放到正确位置
 
 [功能特性](#功能特性) • [快速开始](#快速开始) • [系统架构](#系统架构) • [使用说明](#使用说明) • [开发文档](#开发文档)
 
 </div>
 
 ---
+
+## 当前功能框架与测试入口
+
+如果你想快速知道“这个项目有哪些功能、每个功能怎么触发、盲道/过马路/红绿灯/找物品怎么测试”，请先看：
+
+- [FUNCTION_FRAMEWORK.md](FUNCTION_FRAMEWORK.md)：功能框架、语音命令、触发链路、测试步骤
+
+常用语音命令摘要：
+
+| 功能 | 语音命令示例 | 说明 |
+| --- | --- | --- |
+| 普通对话 | `你看到了什么`、`帮我看看这是什么` | 进入 Qwen-Omni 图像对话 |
+| 找物品 | `找鼠标`、`帮我找一下手机` | 启动 YOLOE 找物和手势引导 |
+| 结束找物 | `找到了`、`拿到了`、`收到` | 停止找物并恢复之前模式 |
+| 盲道导航 | `开始导航`、`盲道导航` | 启动盲道分割和导航播报 |
+| 过马路 | `开始过马路`、`帮我过马路` | 启动斑马线/红绿灯/通行引导 |
+| 红绿灯调试 | `检测红绿灯`、`看红绿灯` | 单独查看红绿灯检测画面 |
+| 停止功能 | `停止导航`、`结束过马路`、`停止红绿灯` | 回到聊天模式 |
+
 <img width="2481" height="3508" alt="1" src="https://github.com/user-attachments/assets/e8dec4a6-8fa6-4d94-bd66-4e9864b67daf" />
 <img width="2480" height="3508" alt="2" src="https://github.com/user-attachments/assets/bc7d1aac-a9e9-4ef8-9d67-224708d0c9fd" />
 <img width="2481" height="3508" alt="4" src="https://github.com/user-attachments/assets/6dd19750-57af-4560-a007-9a7059956b53" />
@@ -116,17 +135,60 @@ pip install -r requirements.txt
 #### 安装 CUDA 和 cuDNN（GPU 加速）
 请参考 [NVIDIA CUDA Toolkit 安装指南](https://developer.nvidia.com/cuda-downloads)
 
+如果已经安装 NVIDIA 驱动并希望启用 YOLOE GPU 推理，请安装 CUDA 版 PyTorch：
+
+```bash
+python -m pip install --upgrade --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu121
+```
+
+验证 CUDA 是否可用：
+
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
+```
+
 ### 3. 下载模型文件
 
-将以下模型文件放入 `model/` 目录：
+推荐直接运行模型准备脚本，它会创建 `model/` 目录，并把项目模型放到正确位置：
 
-| 模型文件 | 用途 | 大小 | 下载链接 |
-|---------|------|------|---------|
-| `yolo-seg.pt` | 盲道分割 | ~50MB | [待补充] |
-| `yoloe-11l-seg.pt` | 开放词汇检测 | ~80MB | [待补充] |
-| `shoppingbest5.pt` | 物品识别 | ~30MB | [待补充] |
-| `trafficlight.pt` | 红绿灯检测 | ~20MB | [待补充] |
-| `hand_landmarker.task` | 手部检测 | ~15MB | [MediaPipe Models](https://developers.google.com/mediapipe/solutions/vision/hand_landmarker#models) |
+```bash
+python prepare_models.py
+```
+
+脚本会优先从 ModelScope 模型仓库拉取项目模型：
+
+```text
+https://www.modelscope.cn/models/archifancy/AIGlasses_for_navigation
+```
+
+必须准备的文件和落点如下：
+
+| 文件 | 必须放置位置 | 用途 |
+|------|--------------|------|
+| `yolo-seg.pt` | `model/yolo-seg.pt` | 盲道 / 斑马线分割 |
+| `yoloe-11l-seg.pt` | `model/yoloe-11l-seg.pt` | YOLOE 开放词汇检测，找物品 / 障碍物检测 |
+| `shoppingbest5.pt` | `model/shoppingbest5.pt` | 兼容旧版物品识别模型 |
+| `trafficlight.pt` | `model/trafficlight.pt` | 红绿灯检测 |
+| `hand_landmarker.task` | `model/hand_landmarker.task` | MediaPipe 手部检测 |
+| `mobileclip_blt.ts` | `mobileclip_blt.ts`（项目根目录） | YOLOE 文本提示特征模型，找物品第一次启动必须用 |
+
+`mobileclip_blt.ts` 不在 `model/` 下，而是在项目根目录。Ultralytics YOLOE 默认会在当前工作目录查找这个文件；如果缺失或下载不完整，“找物品”会卡在 YOLOE 文本特征初始化，或者报 `PytorchStreamReader failed reading zip archive`。
+
+如果自动下载失败，可以手动下载并放到项目根目录：
+
+```text
+https://github.com/ultralytics/assets/releases/download/v8.4.0/mobileclip_blt.ts
+```
+
+安装脚本也会自动执行这一步：
+
+```bash
+# Windows
+setup.bat
+
+# Linux/macOS
+bash setup.sh
+```
 
 ### 4. 配置 API 密钥
 
@@ -334,6 +396,21 @@ python app_main.py
 | `/ws_ui` | UI 状态推送 | JSON |
 | `/ws` | IMU 数据接收 | JSON |
 | `/stream.wav` | 音频下载流 | Binary (WAV) |
+
+### 桌面端 ESP32 模拟器音频
+
+开发调试时可以运行：
+
+```bash
+python desktop_esp32_simulator.py --host 127.0.0.1 --port 8081
+```
+
+模拟器包含两条音频链路：
+
+- 麦克风上行：通过 `/ws_audio` 发送 16k PCM，触发 ASR 和语音指令。
+- 播报下行：通过 `/stream.wav` 接收后端播报，并在电脑扬声器播放。
+
+模拟器窗口里的 `Mic stream recognition` 控制语音识别上行，`Play backend speech` 控制后端播报播放。真实 ESP32 端也需要同时对接这两条链路，否则只能识别说话，听不到导航或找物引导。
 
 ## ⚙️ 配置说明
 

@@ -46,8 +46,10 @@
   .stage-empty span{font-size:14px}
   .stage-dot{width:12px; height:12px; border-radius:50%; background:var(--warn); box-shadow:0 0 22px rgba(255,209,102,.45)}
   .stage-status{
-    position:absolute; left:14px; bottom:14px; z-index:30;
+    position:absolute; left:14px; top:14px; z-index:30;
     display:flex; gap:8px; flex-wrap:wrap; align-items:center;
+    max-width:calc(100% - 340px);
+    pointer-events:none;
   }
 
   /* 右上角：参数 + 日志 */
@@ -165,7 +167,7 @@
 
   .chat-head{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid var(--line)}
   .badges{display:flex;gap:10px;flex-wrap:wrap}
-  .badge{font-size:12px;padding:4px 8px;border-radius:999px;border:1px solid #2d3b50;color:var(--muted);white-space:nowrap}
+  .badge{font-size:12px;padding:4px 8px;border-radius:999px;border:1px solid #2d3b50;color:var(--muted);white-space:nowrap;background:rgba(7,11,16,.62);backdrop-filter:blur(6px)}
   .ok{color:var(--ok);border-color:var(--ok)} .err{color:var(--err);border-color:var(--err)} .warn{color:var(--warn);border-color:var(--warn)}
   .chat-list {
     flex: 1;
@@ -235,6 +237,198 @@
   button{background:#1f6feb;border:1px solid #1f6feb;color:#fff;border-radius:10px;padding:8px 12px;font-weight:600;cursor:pointer}
   .ghost{background:transparent;border-color:#304057;color:#9fb0c3}
 
+  /* Modern console layout */
+  .app{
+    grid-template-columns:minmax(0,1fr) clamp(460px, 32vw, 640px);
+    gap:12px;
+    padding:12px;
+    background:
+      linear-gradient(135deg, rgba(82, 196, 255, 0.04), transparent 28%),
+      linear-gradient(225deg, rgba(125, 235, 155, 0.03), transparent 32%),
+      #05080d;
+  }
+  .stage{
+    border-radius:12px;
+    border-color:#1b2736;
+    box-shadow:0 18px 48px rgba(0,0,0,.34);
+  }
+  .stage-status{
+    left:12px;
+    top:12px;
+    max-width:calc(100% - 340px);
+    gap:6px;
+  }
+  .chat{
+    background:linear-gradient(180deg, rgba(12,18,26,.98), rgba(8,12,18,.98));
+    border-color:#203146;
+    border-radius:12px;
+  }
+  .chat-head{
+    display:grid;
+    grid-template-columns:minmax(0,1fr) 74px;
+    gap:8px;
+    align-items:start;
+    padding:10px 12px;
+    border-bottom:1px solid #203146;
+    background:rgba(10,15,22,.86);
+  }
+  .badges{
+    display:flex;
+    gap:6px;
+    flex-wrap:wrap;
+    align-content:flex-start;
+    max-height:86px;
+    overflow:auto;
+    padding-right:2px;
+  }
+  .badge{
+    font-size:11px;
+    line-height:1.2;
+    padding:5px 8px;
+    border-radius:999px;
+    border:1px solid #31445d;
+    background:rgba(7,11,16,.74);
+  }
+  .controls{
+    display:grid;
+    grid-template-columns:1fr;
+    gap:6px;
+    align-items:start;
+  }
+  .controls button{
+    width:74px;
+    min-height:34px;
+    padding:7px 8px;
+    border-radius:8px;
+    font-size:12px;
+  }
+  .chat-list{
+    padding:10px;
+    gap:10px;
+    overflow:hidden;
+    display:grid;
+    grid-template-rows:auto minmax(120px, .34fr) minmax(260px, 1fr);
+  }
+  .config-panel{
+    padding:0;
+    border:1px solid #203047;
+    border-radius:10px;
+    background:#0b1119;
+    overflow:hidden;
+    box-shadow:0 8px 20px rgba(0,0,0,.16);
+  }
+  .config-panel summary{
+    list-style:none;
+    cursor:pointer;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:8px;
+    padding:10px 12px;
+    color:#d7e2ee;
+    font-size:13px;
+    font-weight:700;
+    border-bottom:1px solid #1b2a3e;
+    background:linear-gradient(180deg, rgba(14,20,28,.96), rgba(9,14,20,.96));
+  }
+  .config-panel summary::-webkit-details-marker{display:none}
+  .config-panel summary::after{
+    content:"▸";
+    color:#9fb0c3;
+    transition:transform .2s ease;
+  }
+  .config-panel[open] summary::after{transform:rotate(90deg)}
+  .config-panel summary small{
+    color:var(--muted);
+    font-size:11px;
+    font-weight:500;
+  }
+  .config-body{
+    padding:10px 12px 12px;
+    max-height:min(42vh, 440px);
+    overflow:auto;
+  }
+  .config-grid{gap:6px}
+  .config-section-title{margin:10px 0 2px}
+  .field-row{
+    gap:8px;
+    grid-template-columns:78px minmax(0,1fr);
+  }
+  .field-row input{
+    height:34px;
+    padding:7px 9px;
+    border-radius:8px;
+    background:#07101a;
+  }
+  .config-actions{
+    margin-top:10px;
+    flex-wrap:wrap;
+  }
+  .config-actions button{
+    padding:7px 10px;
+    border-radius:8px;
+    font-size:12px;
+  }
+  .endpoint-list{gap:6px;margin-top:10px}
+  .endpoint-row{
+    padding:6px 8px;
+    border-radius:8px;
+    grid-template-columns:70px minmax(0,1fr) auto;
+    background:#08111a;
+  }
+  .live,
+  .finals{
+    border-radius:10px;
+    background:#0b1119;
+    border-color:#1e2d40;
+    min-height:0;
+  }
+  .live{
+    padding:10px 12px;
+    border-style:dashed;
+    overflow:hidden;
+    display:flex;
+    flex-direction:column;
+  }
+  .live h2,
+  .finals h2{
+    font-size:12px;
+    letter-spacing:.03em;
+    text-transform:uppercase;
+  }
+  .partial{
+    font-size:18px;
+    line-height:1.45;
+    min-height:2.3em;
+    overflow:auto;
+    padding-right:4px;
+  }
+  .finals{
+    padding:10px;
+    overflow:hidden;
+  }
+  .finals ul{
+    gap:8px;
+    overflow:auto;
+    padding-right:4px;
+  }
+  .bubble{
+    max-width:88%;
+    border-radius:10px;
+    padding:10px 12px;
+  }
+  #cameraWsText,#audioWsText,#imuUdpText{
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+  }
+  .chat-list::-webkit-scrollbar,
+  .config-body::-webkit-scrollbar,
+  #chatContainer::-webkit-scrollbar{width:6px}
+  .chat-list::-webkit-scrollbar-thumb,
+  .config-body::-webkit-scrollbar-thumb,
+  #chatContainer::-webkit-scrollbar-thumb{background:#2a3446;border-radius:999px}
+
   /* 隐藏但保留：校准/滑杆（供 main.js 使用） */
   .hidden-controls{display:none}
 
@@ -270,6 +464,7 @@
     <div class="stage-status">
       <span id="camStatusStage" class="badge warn">Camera HW: waiting</span>
       <span id="audioStatusStage" class="badge warn">Audio HW: waiting</span>
+      <span id="yoloStatusStage" class="badge">YOLO: idle</span>
     </div>
 
     <!-- 左上角：IMU 浮窗（横向） -->
@@ -295,6 +490,9 @@
       <div class="badges">
         <span id="camStatus" class="badge">Viewer: connecting…</span>
         <span id="asrStatus" class="badge">UI: connecting…</span>
+        <span id="modeStatus" class="badge">Mode: --</span>
+        <span id="speakerStatus" class="badge">Speaker: --</span>
+        <span id="yoloStatus" class="badge">YOLO: idle</span>
         <span id="fps" class="badge">FPS: --</span>
       </div>
       <div class="controls">
@@ -303,8 +501,9 @@
       </div>
     </div>
     <div class="chat-list">
-      <div class="config-panel">
-        <h2>设备接入 / 运行配置</h2>
+      <details class="config-panel">
+        <summary><span>设备接入 / 运行配置</span><small>地址、密钥、模型路径</small></summary>
+        <div class="config-body">
         <div class="config-grid">
           <div class="field-row">
             <label for="serverHostInput">服务 IP</label>
@@ -346,7 +545,8 @@
           <div class="endpoint-row"><span>音频</span><code id="audioWsText">-</code><button class="copy-btn" data-copy-target="audioWsText">复制</button></div>
           <div class="endpoint-row"><span>IMU UDP</span><code id="imuUdpText">-</code><button class="copy-btn" data-copy-target="imuUdpText">复制</button></div>
         </div>
-      </div>
+        </div>
+      </details>
       <div class="live">
         <h2>流式识别（Partial）</h2>
         <div class="partial" id="partial">（等待音频…）</div>
@@ -387,6 +587,6 @@
 }</script>
 
 <!-- 主脚本 -->
-<script type="module" src="/static/main.js?v=20260616-models1"></script>
+<script type="module" src="/static/main.js?v=20260617-layout1"></script>
 </body>
 </html>
