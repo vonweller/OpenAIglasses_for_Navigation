@@ -18,6 +18,7 @@ env/
 # Runtime logs and generated recordings
 *.log
 recordings/
+dist/
 
 # Local runtime configuration
 runtime_config.json

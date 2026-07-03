@@ -1,166 +1,406 @@
 @echo off
-REM AI Glass System - Windows 快速安装脚本
+setlocal EnableExtensions EnableDelayedExpansion
 
-echo ==========================================
-echo   AI Glass System - 自动安装脚本
-echo ==========================================
+cd /d "%~dp0"
+
+set "APP_NAME=OpenAI Glasses Navigation"
+set "PORT=8081"
+set "VENV_DIR=.venv-run"
+set "FORCE_INSTALL=0"
+set "CHECK_ONLY=0"
+set "SKIP_MODELS=0"
+set "NO_PAUSE=0"
+set "KILL_PORT=0"
+
+:parse_args
+if "%~1"=="" goto args_done
+if /I "%~1"=="--check" set "CHECK_ONLY=1"
+if /I "%~1"=="--reinstall" set "FORCE_INSTALL=1"
+if /I "%~1"=="--no-models" set "SKIP_MODELS=1"
+if /I "%~1"=="--no-pause" set "NO_PAUSE=1"
+if /I "%~1"=="--kill-port" set "KILL_PORT=1"
+shift
+goto parse_args
+
+:args_done
+echo ============================================================
+echo   %APP_NAME% - one click setup and start
+echo ============================================================
+echo Project: %CD%
 echo.
 
-REM 检查 Python
-echo 正在检查 Python...
-python --version >nul 2>&1
-if errorlevel 1 (
-    echo [错误] 未找到 Python
-    echo 请从 https://www.python.org/downloads/ 下载并安装 Python 3.9-3.11
-    pause
+call :find_boot_python
+if errorlevel 1 goto failed
+
+call :detect_gpu
+call :get_local_ip
+
+if "%CHECK_ONLY%"=="1" (
+    echo.
+    echo [OK] Check finished. No install or startup was performed.
+    echo      Local UI:     http://127.0.0.1:%PORT%/
+    echo      LAN UI:       http://%LOCAL_IP%:%PORT%/
+    echo      Camera WS:    ws://%LOCAL_IP%:%PORT%/ws/camera
+    echo      Audio WS:     ws://%LOCAL_IP%:%PORT%/ws_audio
+    exit /b 0
+)
+
+call :ensure_venv
+if errorlevel 1 goto failed
+
+call :install_dependencies_if_needed
+if errorlevel 1 goto failed
+
+call :ensure_runtime_files
+if errorlevel 1 goto failed
+
+if "%SKIP_MODELS%"=="0" (
+    call :prepare_models
+) else (
+    echo.
+    echo [SKIP] Model preparation was skipped by --no-models.
+)
+
+call :start_backend
+if errorlevel 1 goto failed
+
+echo.
+echo ============================================================
+echo   Ready
+echo ============================================================
+echo Local UI:     http://127.0.0.1:%PORT%/
+echo LAN UI:       http://%LOCAL_IP%:%PORT%/
+echo Camera WS:    ws://%LOCAL_IP%:%PORT%/ws/camera
+echo Audio WS:     ws://%LOCAL_IP%:%PORT%/ws_audio
+echo IMU WS:       ws://%LOCAL_IP%:%PORT%/ws
+echo Logs:         %CD%\logs\backend.stdout.log
+echo Errors:       %CD%\logs\backend.stderr.log
+echo.
+echo Optional commands:
+echo   setup.bat --check       Environment check only
+echo   setup.bat --reinstall   Force dependency reinstall
+echo   setup.bat --no-models   Skip model download/check
+echo   setup.bat --no-pause    Exit without waiting for a key
+echo   setup.bat --kill-port   Kill non-backend process using port %PORT%
+echo.
+if "%NO_PAUSE%"=="0" pause
+exit /b 0
+
+:failed
+echo.
+echo ============================================================
+echo   Setup failed
+echo ============================================================
+echo Check the messages above. If backend startup failed, also inspect:
+echo   %CD%\logs\backend.stderr.log
+echo.
+if "%NO_PAUSE%"=="0" pause
+exit /b 1
+
+:find_boot_python
+echo [1/7] Detecting Python 3.9-3.11...
+set "BOOT_PY="
+
+py -3.11 -c "import sys; raise SystemExit(0 if (3,9) <= sys.version_info[:2] <= (3,11) else 1)" >nul 2>nul
+if not errorlevel 1 set "BOOT_PY=py -3.11"
+
+if not defined BOOT_PY (
+    py -3.10 -c "import sys; raise SystemExit(0 if (3,9) <= sys.version_info[:2] <= (3,11) else 1)" >nul 2>nul
+    if not errorlevel 1 set "BOOT_PY=py -3.10"
+)
+
+if not defined BOOT_PY (
+    py -3.9 -c "import sys; raise SystemExit(0 if (3,9) <= sys.version_info[:2] <= (3,11) else 1)" >nul 2>nul
+    if not errorlevel 1 set "BOOT_PY=py -3.9"
+)
+
+if not defined BOOT_PY if exist "G:\Python\python.exe" (
+    "G:\Python\python.exe" -c "import sys; raise SystemExit(0 if (3,9) <= sys.version_info[:2] <= (3,11) else 1)" >nul 2>nul
+    if not errorlevel 1 set "BOOT_PY=G:\Python\python.exe"
+)
+
+if not defined BOOT_PY (
+    python -c "import sys; raise SystemExit(0 if (3,9) <= sys.version_info[:2] <= (3,11) else 1)" >nul 2>nul
+    if not errorlevel 1 set "BOOT_PY=python"
+)
+
+if not defined BOOT_PY if "%CHECK_ONLY%"=="0" (
+    where winget >nul 2>nul
+    if not errorlevel 1 (
+        echo [RUN] Python 3.9-3.11 was not found. Installing Python 3.10 via winget...
+        winget install -e --id Python.Python.3.10 --scope user --accept-package-agreements --accept-source-agreements
+        if not errorlevel 1 (
+            py -3.10 -c "import sys; raise SystemExit(0 if (3,9) <= sys.version_info[:2] <= (3,11) else 1)" >nul 2>nul
+            if not errorlevel 1 set "BOOT_PY=py -3.10"
+            if not defined BOOT_PY (
+                python -c "import sys; raise SystemExit(0 if (3,9) <= sys.version_info[:2] <= (3,11) else 1)" >nul 2>nul
+                if not errorlevel 1 set "BOOT_PY=python"
+            )
+        )
+    )
+)
+
+if not defined BOOT_PY (
+    echo [ERROR] Python 3.9, 3.10, or 3.11 was not found.
+    echo         Install Python from https://www.python.org/downloads/ or run this script on Windows with winget available.
     exit /b 1
 )
 
-python --version
-echo [成功] Python 已安装
+echo [OK] Python bootstrap command: %BOOT_PY%
+%BOOT_PY% --version
+exit /b 0
 
-REM 检查 CUDA
+:detect_gpu
 echo.
-echo 正在检查 CUDA...
-nvidia-smi >nul 2>&1
-if errorlevel 1 (
-    echo [警告] 未检测到 NVIDIA GPU，将使用 CPU 模式（速度较慢）
-    set HAS_GPU=0
-) else (
-    echo [成功] 检测到 NVIDIA GPU
+echo [2/7] Detecting NVIDIA GPU...
+set "HAS_GPU=0"
+nvidia-smi >nul 2>nul
+if not errorlevel 1 (
+    set "HAS_GPU=1"
+    echo [OK] NVIDIA GPU detected.
     nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
-    set HAS_GPU=1
+) else (
+    echo [INFO] NVIDIA GPU was not detected. CPU PyTorch will be used.
 )
+exit /b 0
 
-REM 创建虚拟环境
+:get_local_ip
+set "LOCAL_IP="
+for /f "usebackq delims=" %%I in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$ip=(Get-NetIPConfiguration | Where-Object {$_.IPv4DefaultGateway -and $_.IPv4Address} | Select-Object -First 1 -ExpandProperty IPv4Address).IPAddress; if(-not $ip){$ip=(Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -notlike '127.*' -and $_.PrefixOrigin -ne 'WellKnown'} | Select-Object -First 1 -ExpandProperty IPAddress)}; if($ip){$ip}"`) do set "LOCAL_IP=%%I"
+if not defined LOCAL_IP set "LOCAL_IP=127.0.0.1"
+echo [OK] LAN IP: %LOCAL_IP%
+exit /b 0
+
+:ensure_venv
 echo.
-echo 正在创建虚拟环境...
-if exist venv (
-    echo [警告] 虚拟环境已存在
-    set /p RECREATE="是否删除并重新创建? (y/n): "
-    if /i "%RECREATE%"=="y" (
-        rmdir /s /q venv
-        python -m venv venv
-        echo [成功] 虚拟环境已重新创建
+echo [3/7] Preparing virtual environment...
+set "PY=%CD%\%VENV_DIR%\Scripts\python.exe"
+
+if exist "%PY%" (
+    echo [OK] Reusing %VENV_DIR%.
+) else (
+    echo [RUN] Creating %VENV_DIR%...
+    %BOOT_PY% -m venv "%VENV_DIR%"
+    if errorlevel 1 (
+        echo [ERROR] Failed to create virtual environment.
+        exit /b 1
     )
-) else (
-    python -m venv venv
-    echo [成功] 虚拟环境已创建
 )
 
-REM 激活虚拟环境
-echo.
-echo 正在激活虚拟环境...
-call venv\Scripts\activate.bat
+"%PY%" --version
+exit /b 0
 
-REM 升级 pip
+:install_dependencies_if_needed
 echo.
-echo 正在升级 pip...
-python -m pip install --upgrade pip -q
-echo [成功] pip 已升级
-
-REM 安装 PyTorch
-echo.
-echo 正在安装 PyTorch...
-if %HAS_GPU%==1 (
-    echo 安装 GPU 版本 PyTorch ^(CUDA 11.8^)...
-    pip install torch==2.0.1+cu118 torchvision==0.15.2+cu118 --index-url https://download.pytorch.org/whl/cu118 -q
-) else (
-    echo 安装 CPU 版本 PyTorch...
-    pip install torch torchvision -q
+echo [4/7] Checking Python dependencies...
+if "%FORCE_INSTALL%"=="0" (
+    call :check_runtime_deps
+    if not errorlevel 1 (
+        if "%HAS_GPU%"=="1" (
+            "%PY%" -c "import torch; raise SystemExit(0 if torch.cuda.is_available() else 1)" >nul 2>nul
+            if errorlevel 1 (
+                echo [INFO] Dependencies exist, but CUDA PyTorch is not active. Reinstalling torch.
+                call :install_torch
+                if errorlevel 1 exit /b 1
+            ) else (
+                echo [OK] Required Python dependencies are already available.
+            )
+        ) else (
+            echo [OK] Required Python dependencies are already available.
+        )
+        exit /b 0
+    )
 )
-echo [成功] PyTorch 已安装
 
-REM 验证 PyTorch
-echo.
-echo 验证 PyTorch 安装...
-python -c "import torch; print(f'PyTorch 版本: {torch.__version__}'); print(f'CUDA 可用: {torch.cuda.is_available()}')"
+echo [RUN] Installing dependencies. This can take several minutes...
+"%PY%" -m pip install --upgrade pip setuptools wheel
+if errorlevel 1 exit /b 1
 
-REM 安装 PyAudio
-echo.
-echo 正在安装 PyAudio...
-echo [警告] PyAudio 在 Windows 上可能需要手动安装
-echo 如果自动安装失败，请从以下地址下载 wheel 文件:
-echo https://www.lfd.uci.edu/~gohlke/pythonlibs/#pyaudio
-echo.
-pip install pyaudio -q
+call :install_torch
+if errorlevel 1 exit /b 1
+
+set "REQ_FILTERED=%TEMP%\aiglass_requirements_%RANDOM%.txt"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Content -LiteralPath 'requirements.txt' | Where-Object {$_ -notmatch '^\s*(torch|torchvision|pyaudio)\b'} | Set-Content -LiteralPath $env:REQ_FILTERED -Encoding ASCII"
 if errorlevel 1 (
-    echo [警告] PyAudio 自动安装失败，请手动安装
-) else (
-    echo [成功] PyAudio 已安装
+    echo [ERROR] Failed to prepare filtered requirements.
+    exit /b 1
 )
 
-REM 安装其他依赖
-echo.
-echo 正在安装 Python 依赖...
-pip install -r requirements.txt -q
-echo [成功] Python 依赖已安装
-
-REM 创建 .env 文件
-echo.
-if not exist .env (
-    echo 正在创建 .env 配置文件...
-    copy .env.example .env >nul
-    echo [成功] .env 文件已创建
-    echo [提示] 请编辑 .env 文件，填入您的 DASHSCOPE_API_KEY
-) else (
-    echo [跳过] .env 文件已存在
-)
-
-REM 创建必要的目录
-echo.
-echo 正在创建目录结构...
-if not exist recordings mkdir recordings
-if not exist model mkdir model
-if not exist music mkdir music
-if not exist voice mkdir voice
-echo [成功] 目录结构已创建
-
-REM 下载/检查模型文件
-echo.
-echo 正在准备模型文件...
-python tools/prepare_models.py
+"%PY%" -m pip install -r "%REQ_FILTERED%"
 if errorlevel 1 (
-    echo [警告] 模型自动准备未完全成功，请按 README 中的模型说明手动补齐
+    echo [ERROR] Dependency installation failed.
+    exit /b 1
 )
 
-REM 检查模型文件
-echo.
-echo 正在复核模型文件...
-set MISSING=0
-if exist model\yolo-seg.pt (echo [成功] yolo-seg.pt) else (echo [缺失] yolo-seg.pt & set MISSING=1)
-if exist model\yoloe-11l-seg.pt (echo [成功] yoloe-11l-seg.pt) else (echo [缺失] yoloe-11l-seg.pt & set MISSING=1)
-if exist model\shoppingbest5.pt (echo [成功] shoppingbest5.pt) else (echo [缺失] shoppingbest5.pt & set MISSING=1)
-if exist model\trafficlight.pt (echo [成功] trafficlight.pt) else (echo [缺失] trafficlight.pt & set MISSING=1)
-if exist model\hand_landmarker.task (echo [成功] hand_landmarker.task) else (echo [缺失] hand_landmarker.task & set MISSING=1)
-if exist mobileclip_blt.ts (echo [成功] mobileclip_blt.ts) else (echo [缺失] mobileclip_blt.ts & set MISSING=1)
+echo [RUN] Installing optional PyAudio...
+"%PY%" -m pip install pyaudio==0.2.14
+if errorlevel 1 (
+    echo [WARN] PyAudio installation failed. ESP32 hardware streaming can still run.
+)
 
-if %MISSING%==1 (
+call :check_runtime_deps
+if errorlevel 1 (
+    echo [ERROR] Dependency verification failed.
+    exit /b 1
+)
+
+echo [OK] Dependencies are ready.
+exit /b 0
+
+:install_torch
+if "%HAS_GPU%"=="1" (
+    echo [RUN] Installing PyTorch 2.5.1 CUDA 12.1 wheel...
+    "%PY%" -m pip install --upgrade --force-reinstall torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+) else (
+    echo [RUN] Installing PyTorch 2.5.1 CPU/default wheel...
+    "%PY%" -m pip install --upgrade torch==2.5.1 torchvision==0.20.1
+)
+if errorlevel 1 (
+    echo [ERROR] PyTorch installation failed.
+    exit /b 1
+)
+exit /b 0
+
+:check_runtime_deps
+"%PY%" -c "import fastapi, uvicorn, cv2, numpy, PIL, ultralytics, torch, mediapipe, dashscope, openai, dotenv, modelscope; from openai import OpenAI; OpenAI(api_key='dependency-check', base_url='https://dashscope.aliyuncs.com/compatible-mode/v1'); print('torch', torch.__version__, 'cuda', torch.cuda.is_available())" >nul 2>nul
+exit /b %ERRORLEVEL%
+
+:ensure_runtime_files
+echo.
+echo [5/7] Preparing runtime files...
+if not exist "logs" mkdir "logs"
+if not exist "recordings" mkdir "recordings"
+if not exist "model" mkdir "model"
+if not exist "music" mkdir "music"
+if not exist "voice" mkdir "voice"
+
+if not exist ".env" (
+    if exist ".env.example" (
+        copy ".env.example" ".env" >nul
+    ) else (
+        > ".env" echo DASHSCOPE_API_KEY=
+    )
+    echo [WARN] Created .env. Fill DASHSCOPE_API_KEY for ASR/Qwen features.
+) else (
+    echo [OK] .env exists.
+)
+
+findstr /R /C:"^DASHSCOPE_API_KEY=." ".env" >nul 2>nul
+if errorlevel 1 echo [WARN] DASHSCOPE_API_KEY looks empty. Backend starts, but online AI/ASR may fail until configured.
+exit /b 0
+
+:prepare_models
+echo.
+echo [6/7] Preparing model files...
+"%PY%" "tools\prepare_models.py"
+if errorlevel 1 (
+    echo [WARN] Model preparation did not fully complete. Existing local models will still be used if present.
+)
+
+set "MISSING_MODEL=0"
+for %%F in (
+    "model\yolo-seg.pt"
+    "model\yoloe-11l-seg.pt"
+    "model\shoppingbest5.pt"
+    "model\trafficlight.pt"
+    "model\hand_landmarker.task"
+    "mobileclip_blt.ts"
+) do (
+    if exist "%%~F" (
+        echo [OK] %%~F
+    ) else (
+        echo [MISS] %%~F
+        set "MISSING_MODEL=1"
+    )
+)
+
+if "%MISSING_MODEL%"=="1" (
+    echo [WARN] Some model files are missing. Startup will continue; related features may be unavailable.
+)
+exit /b 0
+
+:start_backend
+echo.
+echo [7/7] Starting backend...
+call :get_port_pid
+if defined PORT_PID (
+    call :is_our_backend
+    if not errorlevel 1 (
+        echo [OK] Port %PORT% is already used by this backend. PID: %PORT_PID%
+        echo [INFO] Reusing the running backend/process.
+        start "" "http://127.0.0.1:%PORT%/"
+        exit /b 0
+    )
+
+    echo [ERROR] Port %PORT% is already used by another process.
+    call :describe_port_owner
+    if "%KILL_PORT%"=="1" (
+        echo [RUN] Killing PID %PORT_PID% because --kill-port was provided...
+        taskkill /PID %PORT_PID% /F
+        if errorlevel 1 exit /b 1
+        timeout /t 2 /nobreak >nul
+        call :get_port_pid
+        if defined PORT_PID (
+            echo [ERROR] Port %PORT% is still busy after taskkill.
+            call :describe_port_owner
+            exit /b 1
+        )
+    ) else (
+        echo.
+        echo Close the process above, or run:
+        echo   setup.bat --kill-port
+        exit /b 1
+    )
+)
+
+set "STDOUT_LOG=%CD%\logs\backend.stdout.log"
+set "STDERR_LOG=%CD%\logs\backend.stderr.log"
+echo [RUN] Launching app_main.py...
+start "AI Glass Backend" /min "%COMSPEC%" /c ""%PY%" app_main.py 1>"%STDOUT_LOG%" 2>"%STDERR_LOG%""
+
+set /a WAIT_COUNT=0
+:wait_backend
+call :get_port_pid
+if defined PORT_PID (
+    call :is_our_backend
+    if not errorlevel 1 goto backend_ready
+    goto backend_port_busy
+)
+set /a WAIT_COUNT+=1
+if !WAIT_COUNT! GEQ 60 goto backend_timeout
+timeout /t 1 /nobreak >nul
+goto wait_backend
+
+:backend_ready
+echo [OK] Backend is listening on port %PORT%. PID: %PORT_PID%
+start "" "http://127.0.0.1:%PORT%/"
+exit /b 0
+
+:backend_timeout
+echo [ERROR] Backend did not listen on port %PORT% within 60 seconds.
+if exist "%STDERR_LOG%" (
     echo.
-    echo [警告] 部分模型文件缺失，请将模型文件放入 README 指定位置
+    echo Last backend errors:
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Content -LiteralPath $env:STDERR_LOG -Tail 30"
 )
+exit /b 1
 
-REM 完成
-echo.
-echo ==========================================
-echo [成功] 安装完成!
-echo ==========================================
-echo.
-echo 下一步:
-echo 1. 编辑 .env 文件，填入您的 API 密钥:
-echo    notepad .env
-echo.
-echo 2. 确保模型文件已放入 model\，并且 mobileclip_blt.ts 位于项目根目录
-echo.
-echo 3. 启动系统:
-echo    venv\Scripts\activate
-echo    python app_main.py
-echo.
-echo 4. 访问 http://localhost:8081
-echo.
-echo [提示] 每次使用前请激活虚拟环境:
-echo   venv\Scripts\activate
-echo.
+:backend_port_busy
+echo [ERROR] Another process took port %PORT% while backend was starting.
+call :describe_port_owner
+exit /b 1
 
-pause
+:get_port_pid
+set "PORT_PID="
+for /f "usebackq delims=" %%P in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$c=Get-NetTCPConnection -LocalPort %PORT% -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; if($c){$c.OwningProcess}"`) do set "PORT_PID=%%P"
+exit /b 0
 
+:is_our_backend
+if not defined PORT_PID exit /b 1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$p=Get-CimInstance Win32_Process -Filter 'ProcessId=%PORT_PID%' -ErrorAction SilentlyContinue; if($p -and $p.CommandLine -match 'app_main\.py'){exit 0}else{exit 1}" >nul 2>nul
+exit /b %ERRORLEVEL%
+
+:describe_port_owner
+if not defined PORT_PID exit /b 0
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$p=Get-CimInstance Win32_Process -Filter 'ProcessId=%PORT_PID%' -ErrorAction SilentlyContinue; if($p){Write-Host ('  PID:     ' + $p.ProcessId); Write-Host ('  Name:    ' + $p.Name); Write-Host ('  Path:    ' + $p.ExecutablePath); Write-Host ('  Command: ' + $p.CommandLine)}"
+exit /b 0
