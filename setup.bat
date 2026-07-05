@@ -11,6 +11,8 @@ set "CHECK_ONLY=0"
 set "SKIP_MODELS=0"
 set "NO_PAUSE=0"
 set "KILL_PORT=0"
+set "PYTHONNOUSERSITE=1"
+set "PIP_DISABLE_PIP_VERSION_CHECK=1"
 
 :parse_args
 if "%~1"=="" goto args_done
@@ -114,11 +116,6 @@ if not defined BOOT_PY (
     if not errorlevel 1 set "BOOT_PY=py -3.9"
 )
 
-if not defined BOOT_PY if exist "G:\Python\python.exe" (
-    "G:\Python\python.exe" -c "import sys; raise SystemExit(0 if (3,9) <= sys.version_info[:2] <= (3,11) else 1)" >nul 2>nul
-    if not errorlevel 1 set "BOOT_PY=G:\Python\python.exe"
-)
-
 if not defined BOOT_PY (
     python -c "import sys; raise SystemExit(0 if (3,9) <= sys.version_info[:2] <= (3,11) else 1)" >nul 2>nul
     if not errorlevel 1 set "BOOT_PY=python"
@@ -188,6 +185,11 @@ if exist "%PY%" (
 )
 
 "%PY%" --version
+"%PY%" -c "import sys; print('[OK] venv:', sys.prefix); raise SystemExit(1 if sys.prefix == sys.base_prefix else 0)"
+if errorlevel 1 (
+    echo [ERROR] Python virtual environment is not active/correct.
+    exit /b 1
+)
 exit /b 0
 
 :install_dependencies_if_needed
@@ -232,6 +234,10 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo [RUN] Enforcing NumPy 1.x ABI for OpenCV/MediaPipe compatibility...
+"%PY%" -m pip install --force-reinstall --no-deps numpy==1.24.3
+if errorlevel 1 exit /b 1
+
 echo [RUN] Installing optional PyAudio...
 "%PY%" -m pip install pyaudio==0.2.14
 if errorlevel 1 (
@@ -262,7 +268,7 @@ if errorlevel 1 (
 exit /b 0
 
 :check_runtime_deps
-"%PY%" -c "import fastapi, uvicorn, cv2, numpy, PIL, ultralytics, torch, mediapipe, dashscope, openai, dotenv, modelscope; from openai import OpenAI; OpenAI(api_key='dependency-check', base_url='https://dashscope.aliyuncs.com/compatible-mode/v1'); print('torch', torch.__version__, 'cuda', torch.cuda.is_available())" >nul 2>nul
+"%PY%" -c "import inspect, sys, fastapi, uvicorn, cv2, numpy, PIL, ultralytics, torch, mediapipe, dashscope, openai, dotenv, modelscope, clip, lap; from openai import OpenAI; c=OpenAI(api_key='dependency-check', base_url='https://dashscope.aliyuncs.com/compatible-mode/v1'); sig=str(inspect.signature(c.chat.completions.create)); bad=(sys.prefix == sys.base_prefix or not (ultralytics.__version__ == '8.4.88') or 'modalities' not in sig or 'audio' not in sig); raise SystemExit(1 if bad else 0)" >nul 2>nul
 exit /b %ERRORLEVEL%
 
 :ensure_runtime_files
@@ -301,10 +307,12 @@ set "MISSING_MODEL=0"
 for %%F in (
     "model\yolo-seg.pt"
     "model\yoloe-11l-seg.pt"
+    "model\yoloe-26s-seg.pt"
     "model\shoppingbest5.pt"
     "model\trafficlight.pt"
     "model\hand_landmarker.task"
     "mobileclip_blt.ts"
+    "mobileclip2_b.ts"
 ) do (
     if exist "%%~F" (
         echo [OK] %%~F
@@ -315,7 +323,15 @@ for %%F in (
 )
 
 if "%MISSING_MODEL%"=="1" (
-    echo [WARN] Some model files are missing. Startup will continue; related features may be unavailable.
+    echo [ERROR] Some required model files are missing.
+    echo         Re-run setup.bat after checking network access, or copy the missing files into this folder.
+    exit /b 1
+)
+
+"%PY%" -c "from pathlib import Path; checks={'model/yoloe-26s-seg.pt':10*1024*1024,'mobileclip2_b.ts':200*1024*1024,'mobileclip_blt.ts':500*1024*1024}; bad=[f'{p} ({Path(p).stat().st_size if Path(p).exists() else 0} bytes)' for p,n in checks.items() if (not Path(p).exists()) or Path(p).stat().st_size < n]; print('[OK] model size check passed' if not bad else '[ERROR] incomplete model files: '+', '.join(bad)); raise SystemExit(1 if bad else 0)"
+if errorlevel 1 (
+    echo [ERROR] Model/text-encoder files are incomplete or corrupt.
+    exit /b 1
 )
 exit /b 0
 
@@ -356,7 +372,13 @@ if defined PORT_PID (
 set "STDOUT_LOG=%CD%\logs\backend.stdout.log"
 set "STDERR_LOG=%CD%\logs\backend.stderr.log"
 echo [RUN] Launching app_main.py...
-start "AI Glass Backend" /min "%COMSPEC%" /c ""%PY%" app_main.py 1>"%STDOUT_LOG%" 2>"%STDERR_LOG%""
+if exist "%STDOUT_LOG%" del /f /q "%STDOUT_LOG%"
+if exist "%STDERR_LOG%" del /f /q "%STDERR_LOG%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$app=Join-Path -Path '%CD%' -ChildPath 'app_main.py'; $p=Start-Process -FilePath '%PY%' -ArgumentList @($app) -WorkingDirectory '%CD%' -RedirectStandardOutput '%STDOUT_LOG%' -RedirectStandardError '%STDERR_LOG%' -WindowStyle Hidden -PassThru; if($p){exit 0}else{exit 1}"
+if errorlevel 1 (
+    echo [ERROR] Failed to launch backend process.
+    exit /b 1
+)
 
 set /a WAIT_COUNT=0
 :wait_backend
@@ -397,7 +419,7 @@ exit /b 0
 
 :is_our_backend
 if not defined PORT_PID exit /b 1
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$p=Get-CimInstance Win32_Process -Filter 'ProcessId=%PORT_PID%' -ErrorAction SilentlyContinue; if($p -and $p.CommandLine -match 'app_main\.py'){exit 0}else{exit 1}" >nul 2>nul
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$expected=[regex]::Escape((Join-Path -Path (Resolve-Path -LiteralPath '%CD%') -ChildPath 'app_main.py')); $p=Get-CimInstance Win32_Process -Filter 'ProcessId=%PORT_PID%' -ErrorAction SilentlyContinue; if($p -and $p.CommandLine -match $expected){exit 0}else{exit 1}" >nul 2>nul
 exit /b %ERRORLEVEL%
 
 :describe_port_owner

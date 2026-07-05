@@ -5,10 +5,12 @@
 This script keeps the on-disk layout explicit:
 - model/yolo-seg.pt
 - model/yoloe-11l-seg.pt
+- model/yoloe-26s-seg.pt
 - model/shoppingbest5.pt
 - model/trafficlight.pt
 - model/hand_landmarker.task
 - ./mobileclip_blt.ts
+- ./mobileclip2_b.ts
 
 It first tries to copy files from a ModelScope snapshot of the bundled model repo.
 If a file is still missing, it falls back to a direct download for mobileclip_blt.ts.
@@ -29,13 +31,18 @@ SNAPSHOT_ROOT = os.getenv("AIGLASS_MODEL_SNAPSHOT", "").strip()
 MODEL_FILES = [
     "yolo-seg.pt",
     "yoloe-11l-seg.pt",
+    "yoloe-26s-seg.pt",
     "shoppingbest5.pt",
     "trafficlight.pt",
     "hand_landmarker.task",
 ]
+ULTRALYTICS_MODEL_FILES = {"yoloe-26s-seg.pt"}
 MOBILECLIP_NAME = "mobileclip_blt.ts"
 MOBILECLIP_URL = "https://github.com/ultralytics/assets/releases/download/v8.4.0/mobileclip_blt.ts"
 MOBILECLIP_MIN_BYTES = 500 * 1024 * 1024
+MOBILECLIP2_NAME = "mobileclip2_b.ts"
+MOBILECLIP2_URL = "https://github.com/ultralytics/assets/releases/download/v8.4.0/mobileclip2_b.ts"
+MOBILECLIP2_MIN_BYTES = 200 * 1024 * 1024
 
 
 def log(msg: str) -> None:
@@ -109,6 +116,28 @@ def prepare_mobileclip(dest: Path) -> bool:
         return False
 
 
+def prepare_ultralytics_model(filename: str, dest: Path) -> bool:
+    if filename not in ULTRALYTICS_MODEL_FILES:
+        return False
+    try:
+        from ultralytics import YOLOE
+        log(f"[models] downloading {filename} with Ultralytics ...")
+        model = YOLOE(filename)
+        src = APP_DIR / filename
+        ckpt_value = str(getattr(model, "ckpt_path", "") or "")
+        ckpt_path = Path(ckpt_value) if ckpt_value else None
+        if src.exists():
+            shutil.move(str(src), str(dest))
+        elif ckpt_path and ckpt_path.exists():
+            shutil.copy2(ckpt_path, dest)
+        if dest.exists() and dest.stat().st_size > 0:
+            log(f"[models] downloaded model/{filename}")
+            return True
+    except Exception as exc:
+        log(f"[models] Ultralytics download failed for {filename}: {exc}")
+    return False
+
+
 def main() -> int:
     ensure_dirs()
     snapshot_root = load_modelscope_snapshot()
@@ -121,6 +150,8 @@ def main() -> int:
             continue
         if snapshot_root and copy_from_snapshot(snapshot_root, filename, dest):
             continue
+        if prepare_ultralytics_model(filename, dest):
+            continue
         missing.append(dest)
 
     mobileclip_ok = False
@@ -130,19 +161,37 @@ def main() -> int:
     else:
         mobileclip_ok = prepare_mobileclip(mobileclip_dest)
 
+    mobileclip2_ok = False
+    mobileclip2_dest = APP_DIR / MOBILECLIP2_NAME
+    if mobileclip2_dest.exists() and mobileclip2_dest.stat().st_size >= MOBILECLIP2_MIN_BYTES:
+        log(f"[models] 宸插瓨鍦?{MOBILECLIP2_NAME} ({mobileclip2_dest.stat().st_size // (1024 * 1024)} MB)")
+        mobileclip2_ok = True
+    elif snapshot_root and copy_from_snapshot(snapshot_root, MOBILECLIP2_NAME, mobileclip2_dest):
+        mobileclip2_ok = True
+    else:
+        try:
+            download_file(MOBILECLIP2_URL, mobileclip2_dest)
+            mobileclip2_ok = mobileclip2_dest.exists() and mobileclip2_dest.stat().st_size >= MOBILECLIP2_MIN_BYTES
+            size_mb = mobileclip2_dest.stat().st_size / (1024 * 1024) if mobileclip2_dest.exists() else 0
+            log(f"[models] 宸蹭笅杞?{MOBILECLIP2_NAME} ({size_mb:.1f} MB)")
+        except Exception as exc:
+            log(f"[models] 涓嬭浇 {MOBILECLIP2_NAME} 澶辫触: {exc}")
+
     log("")
     log("[models] 结果:")
     for filename in MODEL_FILES:
         dest = MODEL_DIR / filename
         log(f"  - {dest.relative_to(APP_DIR)}: {'OK' if dest.exists() and dest.stat().st_size > 0 else 'MISSING'}")
     log(f"  - {MOBILECLIP_NAME}: {'OK' if mobileclip_ok else 'MISSING'}")
+    log(f"  - {MOBILECLIP2_NAME}: {'OK' if mobileclip2_ok else 'MISSING'}")
 
-    if missing or not mobileclip_ok:
+    if missing or not mobileclip_ok or not mobileclip2_ok:
         log("")
         log("[models] 仍有缺失文件时，可手动放到以下位置:")
         for dest in missing:
             log(f"  - {dest.relative_to(APP_DIR)}")
         log(f"  - {MOBILECLIP_NAME}")
+        log(f"  - {MOBILECLIP2_NAME}")
         return 1
 
     return 0

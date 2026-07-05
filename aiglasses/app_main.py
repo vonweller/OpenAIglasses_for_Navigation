@@ -42,7 +42,15 @@ DEFAULT_NAV_SEG_MODEL = os.path.join(DEFAULT_MODEL_DIR, "yolo-seg.pt")
 DEFAULT_OBSTACLE_MODEL = os.path.join(DEFAULT_MODEL_DIR, "yoloe-11l-seg.pt")
 DEFAULT_TRAFFIC_MODEL = os.path.join(DEFAULT_MODEL_DIR, "trafficlight.pt")
 DEFAULT_HAND_TASK = os.path.join(DEFAULT_MODEL_DIR, "hand_landmarker.task")
-DEFAULT_ITEM_MODEL = os.path.join(DEFAULT_MODEL_DIR, "yoloe-11l-seg.pt")
+DEFAULT_ITEM_MODEL = os.path.join(DEFAULT_MODEL_DIR, "yoloe-26s-seg.pt")
+DEFAULT_YOLOE_PREWARM_CLASSES = ",".join([
+    "cell phone", "mobile phone", "phone", "mouse", "keyboard", "laptop", "tablet",
+    "computer monitor", "remote control", "charger", "cable", "earphones", "headphones",
+    "watch", "smart watch", "glasses", "wallet", "key", "book", "notebook", "backpack",
+    "handbag", "cup", "bottle", "bowl", "spoon", "fork", "chair", "table", "sofa",
+    "bed", "cabinet", "door", "apple", "banana", "orange", "grape", "pear",
+    "watermelon", "car", "bus", "bicycle", "motorcycle", "truck",
+])
 RUNTIME_CONFIG_PATH = str(PROJECT_RUNTIME_CONFIG_PATH)
 MODEL_CONFIG_FIELDS = {
     "blind_path_model": ("BLIND_PATH_MODEL", DEFAULT_NAV_SEG_MODEL),
@@ -92,6 +100,7 @@ from .audio_stream import (
     register_stream_route,         # 挂 /stream.wav
     broadcast_pcm16_realtime,      # 实时向连接分发 16k PCM
     hard_reset_audio,              # 音频+AI 播放总闸
+    soft_reset_audio,
     BYTES_PER_20MS_16K,
     is_playing_now,
     current_ai_task,
@@ -210,13 +219,19 @@ load_navigation_models()
 print(f"[NAVIGATION] 模型加载完成 - yolo_seg_model: {yolo_seg_model is not None}")
 
 # 【新增】启动同步录制
-print("[RECORDER] 启动同步录制系统...")
-sync_recorder.start_recording()
-print("[RECORDER] 录制系统已启动，将自动保存视频和音频")
+ENABLE_SYNC_RECORDING = os.getenv("AIGLASS_RECORDING", "0").strip().lower() in ("1", "true", "yes", "on")
+if ENABLE_SYNC_RECORDING:
+    print("[RECORDER] 启动同步录制系统...")
+    sync_recorder.start_recording()
+    print("[RECORDER] 录制系统已启动，将自动保存视频和音频")
+else:
+    print("[RECORDER] 同步录制已关闭（AIGLASS_RECORDING=0），降低调试时CPU/磁盘负载")
 
 # 【新增】注册退出处理器，确保Ctrl+C时保存录制文件
 def cleanup_on_exit():
     """程序退出时的清理工作"""
+    if not ENABLE_SYNC_RECORDING:
+        return
     print("\n[SYSTEM] 正在关闭录制器...")
     try:
         sync_recorder.stop_recording()
@@ -236,7 +251,8 @@ signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
 signal.signal(signal.SIGTERM, signal_handler)  # 终止信号
 atexit.register(cleanup_on_exit)  # 正常退出时也调用
 
-print("[RECORDER] 已注册退出处理器 - Ctrl+C时会自动保存录制文件")
+if ENABLE_SYNC_RECORDING:
+    print("[RECORDER] 已注册退出处理器 - Ctrl+C时会自动保存录制文件")
 
 
 
@@ -349,11 +365,16 @@ def start_yolomedia_with_target(target_name: str):
     
     # 查找对应的YOLO类别
     yolo_class = ITEM_TO_CLASS_MAP.get(target_name, target_name)
+    try:
+        from .yoloe_backend import is_yoloe_text_cached
+        text_ready = is_yoloe_text_cached([yolo_class])
+    except Exception:
+        text_ready = False
     print(f"[YOLOMEDIA] Starting with target: {target_name} -> YOLO class: {yolo_class}", flush=True)
     print(f"[YOLOMEDIA] Available mappings: {ITEM_TO_CLASS_MAP}", flush=True)  # 添加这行调试
     bridge_io.set_yolo_status(
         running=True,
-        phase="starting",
+        phase="starting" if text_ready else "lazy_prewarm",
         target=yolo_class,
         backend="YOLOE",
         frames=0,
@@ -370,6 +391,31 @@ def start_yolomedia_with_target(target_name: str):
     def _run():
         try:
             # 传递目标类别名和停止事件
+            if not text_ready:
+                bridge_io.set_yolo_status(
+                    running=True,
+                    phase="lazy_prewarm",
+                    target=yolo_class,
+                    backend="YOLOE",
+                    last_error="",
+                )
+                try:
+                    from .yoloe_backend import prewarm_yoloe
+                    print(f"[YOLOMEDIA] lazy prewarm started for: {yolo_class}", flush=True)
+                    prewarm_yoloe([yolo_class])
+                    print(f"[YOLOMEDIA] lazy prewarm finished for: {yolo_class}", flush=True)
+                except Exception as exc:
+                    print(f"[YOLOMEDIA] lazy prewarm failed for {yolo_class}: {exc}", flush=True)
+                    bridge_io.set_yolo_status(
+                        running=True,
+                        phase="lazy_prewarm_failed",
+                        target=yolo_class,
+                        backend="YOLOE",
+                        last_error=str(exc),
+                    )
+                if yolomedia_stop_event.is_set():
+                    print(f"[YOLOMEDIA] lazy prewarm cancelled for: {yolo_class}", flush=True)
+                    return
             yolomedia.main(headless=True, prompt_name=yolo_class, stop_event=yolomedia_stop_event)
         except Exception as e:
             print(f"[YOLOMEDIA] worker stopped: {e}", flush=True)
@@ -679,8 +725,6 @@ async def start_ai_with_text(user_text: str):
                 if not sc.abort_event.is_set():
                     try: sc.q.put_nowait(b"\x00"*BYTES_PER_20MS_16K)  # 一帧静音
                     except Exception: pass
-                    try: sc.q.put_nowait(None)
-                    except Exception: pass
 
             final_text = ("".join(txt_buf)).strip() or "（空响应）"
             try:
@@ -689,7 +733,7 @@ async def start_ai_with_text(user_text: str):
                 pass
 
     # 真正启动前先硬重置，保证**绝无**旧音频残留
-    await hard_reset_audio("start_ai_with_text")
+    await soft_reset_audio("start_ai_with_text")
     loop = asyncio.get_running_loop()
     from .audio_stream import current_ai_task as _task_holder  # 读写模块内全局
     from .audio_stream import __dict__ as _as_dict
@@ -1540,6 +1584,21 @@ async def on_startup_init_audio():
             print(f"[AUDIO] 初始化失败: {e}")
     
     threading.Thread(target=_init, daemon=True).start()
+
+@app.on_event("startup")
+async def on_startup_prewarm_yoloe():
+    def _prewarm():
+        try:
+            from .yoloe_backend import prewarm_yoloe
+            raw = os.getenv("AIGLASS_YOLOE_PREWARM_CLASSES", DEFAULT_YOLOE_PREWARM_CLASSES)
+            names = [x.strip() for x in raw.split(",") if x.strip()]
+            names.extend(ITEM_TO_CLASS_MAP.values())
+            prewarm_yoloe(names)
+        except Exception as e:
+            print(f"[YOLOE] prewarm failed: {e}", flush=True)
+
+    if os.getenv("AIGLASS_YOLOE_PREWARM", "1").strip().lower() not in ("0", "false", "no", "off"):
+        threading.Thread(target=_prewarm, name="yoloe-prewarm", daemon=True).start()
 
 @app.on_event("startup")
 async def on_startup():

@@ -36,8 +36,8 @@ except ModuleNotFoundError:
 
 from .audio_player import play_audio_threadsafe
 PERF_DEBUG = False        # 打印调试信息（False 关闭）
-HAND_DOWNSCALE = 0.8      # HandLandmarker 的输入缩放 0.5=长宽各减半（≈1/4 像素量）
-HAND_FPS_DIV = 1          # 人手每 2 帧跑一次（1=每帧；2=隔帧；3=每3帧）
+HAND_DOWNSCALE = float(os.getenv("AIGLASS_HAND_DOWNSCALE", "0.5"))  # 0.5=长宽各减半（≈1/4 像素量）
+HAND_FPS_DIV = max(1, int(os.getenv("AIGLASS_HAND_FPS_DIV", "2")))  # 1=每帧；2=隔帧；3=每3帧
 
 
 # === 前端风格配色（BGR） + UI叠加管理（左下角按行堆叠） ===
@@ -150,9 +150,9 @@ TRACK_EPSILON_FACTOR = 0.003    # 追踪模式下的轮廓精度因子
 # ========= YOLO实时矫正参数 =========
 YOLO_CORRECTION_IOU_THRESHOLD = 0.2  # IoU阈值，越低越积极矫正
 YOLO_CORRECTION_CONF_THRESHOLD = 0.15  # 置信度阈值，越低检测越敏感
-YOLOE_SEGMENT_INTERVAL = max(1, int(os.getenv("AIGLASS_YOLOE_SEGMENT_INTERVAL", "3")))
+YOLOE_SEGMENT_INTERVAL = max(1, int(os.getenv("AIGLASS_YOLOE_SEGMENT_INTERVAL", "5")))
 YOLOE_TRACK_INTERVAL = max(1, int(os.getenv("AIGLASS_YOLOE_TRACK_INTERVAL", "6")))
-YOLOE_IMGSZ = int(os.getenv("AIGLASS_YOLOE_IMGSZ", "512"))
+YOLOE_IMGSZ = int(os.getenv("AIGLASS_YOLOE_IMGSZ", "416"))
 
 # ========= 方向引导音频路径 =========
 AUDIO_DIR = r"E:\沙粒云\自媒体\2025视频制作\20250925AI眼镜\AI眼镜合并\audio"  # 请修改为实际路径

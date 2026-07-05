@@ -19,11 +19,57 @@ LOCAL_CN2EN = {
     "鼠标": "mouse",
     "鼠标垫": "mouse pad",
     "键盘": "keyboard",
-    "手机": "phone",
+    "手机": "cell phone",
+    "手晶": "cell phone",
+    "手经": "cell phone",
+    "手机壳": "cell phone",
+    "phone": "cell phone",
+    "mobile": "cell phone",
+    "mobile phone": "cell phone",
+    "cellphone": "cell phone",
+    "cell phone": "cell phone",
     "杯子": "cup",
     "水杯": "cup",
     "电脑": "laptop",
     "笔记本电脑": "laptop",
+    "平板": "tablet",
+    "平板电脑": "tablet",
+    "显示器": "computer monitor",
+    "屏幕": "computer monitor",
+    "遥控器": "remote control",
+    "充电器": "charger",
+    "数据线": "cable",
+    "耳机": "earphones",
+    "头戴耳机": "headphones",
+    "眼镜": "glasses",
+    "钥匙": "key",
+    "钱包": "wallet",
+    "书": "book",
+    "书本": "book",
+    "笔记本": "notebook",
+    "书包": "backpack",
+    "背包": "backpack",
+    "包": "handbag",
+    "手表": "watch",
+    "智能手表": "smart watch",
+    "椅子": "chair",
+    "桌子": "table",
+    "沙发": "sofa",
+    "床": "bed",
+    "柜子": "cabinet",
+    "门": "door",
+    "苹果": "apple",
+    "香蕉": "banana",
+    "橙子": "orange",
+    "葡萄": "grape",
+    "梨": "pear",
+    "西瓜": "watermelon",
+    "汽车": "car",
+    "车": "car",
+    "公交车": "bus",
+    "自行车": "bicycle",
+    "摩托车": "motorcycle",
+    "卡车": "truck",
 }
 
 QUERY_NOISE_RE = re.compile(
@@ -52,6 +98,14 @@ PROMPT_SYS = (
     "Output ONLY the label, no punctuation."
 )
 
+LABEL_ALIASES = {
+    "phone": "cell phone",
+    "mobile": "cell phone",
+    "mobile phone": "cell phone",
+    "cellphone": "cell phone",
+    "smartphone": "cell phone",
+}
+
 def extract_english_label(query_cn: str) -> Tuple[str, str]:
     """
     返回 (label_en, source)；source ∈ {'local', 'qwen', 'fallback'}
@@ -79,7 +133,8 @@ def extract_english_label(query_cn: str) -> Tuple[str, str]:
         )
         label = (rsp.choices[0].message.content or "").strip()
         # 清洗一下
-        label = label.replace(".", "").replace(",", "").replace("  ", " ").strip()
+        label = label.replace(".", "").replace(",", "").replace("  ", " ").strip().lower()
+        label = LABEL_ALIASES.get(label, label)
         # 兜底：空就回 'bottle'
         return (label or "bottle"), "qwen"
     except Exception:

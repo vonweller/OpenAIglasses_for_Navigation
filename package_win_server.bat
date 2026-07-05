@@ -46,6 +46,9 @@ if errorlevel 1 goto failed
 call :copy_payload
 if errorlevel 1 goto failed
 
+call :verify_stage
+if errorlevel 1 goto failed
+
 call :write_server_notes
 if errorlevel 1 goto failed
 
@@ -129,7 +132,7 @@ exit /b 0
 
 :copy_payload
 echo.
-echo [1/3] Copying project files...
+echo [1/4] Copying project files...
 
 robocopy "%CD%\aiglasses" "%STAGE_DIR%\aiglasses" /E /XD "__pycache__" /XF "*.pyc" "*.pyo" >nul
 if %ERRORLEVEL% GEQ 8 exit /b 1
@@ -185,6 +188,8 @@ for %%F in (
 )
 
 if exist "%CD%\mobileclip_blt.ts" copy /Y "%CD%\mobileclip_blt.ts" "%STAGE_DIR%\mobileclip_blt.ts" >nul
+if exist "%CD%\mobileclip2_b.ts" copy /Y "%CD%\mobileclip2_b.ts" "%STAGE_DIR%\mobileclip2_b.ts" >nul
+if exist "%CD%\.env.example" copy /Y "%CD%\.env.example" "%STAGE_DIR%\.env.example" >nul
 
 if "%INCLUDE_ENV%"=="1" (
     if exist "%CD%\.env" (
@@ -198,21 +203,59 @@ if "%INCLUDE_ENV%"=="1" (
 echo [OK] Payload copied.
 exit /b 0
 
+:verify_stage
+echo.
+echo [2/4] Verifying staged package...
+set "VERIFY_FAILED=0"
+for %%F in (
+    "app_main.py"
+    "requirements.txt"
+    "setup.bat"
+    "tools\prepare_models.py"
+    "aiglasses\app_main.py"
+    "aiglasses\yoloe_backend.py"
+) do (
+    if exist "%STAGE_DIR%\%%~F" (
+        echo [OK] %%~F
+    ) else (
+        echo [ERROR] Missing required file: %%~F
+        set "VERIFY_FAILED=1"
+    )
+)
+
+for %%F in (
+    "model\yoloe-26s-seg.pt"
+    "mobileclip2_b.ts"
+    "mobileclip_blt.ts"
+) do (
+    if exist "%STAGE_DIR%\%%~F" (
+        echo [OK] bundled %%~F
+    ) else (
+        echo [WARN] %%~F not bundled. setup.bat will try to download/prepare it on the server.
+    )
+)
+
+if "%VERIFY_FAILED%"=="1" exit /b 1
+exit /b 0
+
 :write_server_notes
 echo.
-echo [2/3] Writing server notes...
+echo [3/4] Writing server notes...
 (
     echo # Windows Server Deployment
     echo.
     echo 1. Extract this ZIP on the Windows server.
-    echo 2. Run setup.bat from this folder.
+    echo 2. Run setup.bat from this folder. Use setup.bat --reinstall --kill-port if you want a completely fresh environment.
     echo 3. Fill DASHSCOPE_API_KEY in .env or in the web UI runtime config.
     echo.
     echo Important:
     echo - .env is excluded by default to avoid leaking local secrets.
     echo - runtime_config.json is excluded because it may contain local absolute paths.
     echo - .venv, .venv-run, logs, recordings, .git, .vs, and __pycache__ are excluded.
-    echo - setup.bat will create .venv-run, install dependencies, prepare models, and start the backend.
+    echo - setup.bat will create .venv-run, install pinned dependencies, prepare models, and start the backend.
+    echo - The item-search model defaults to model/yoloe-26s-seg.pt with ultralytics==8.4.88.
+    echo - YOLOE-26S requires mobileclip2_b.ts. If it is not bundled, setup.bat downloads it automatically.
+    echo - If the server has an NVIDIA GPU, setup.bat installs the CUDA 12.1 PyTorch wheel and verifies torch.cuda.
     echo.
     echo Default server endpoints after setup:
     echo - UI: http://SERVER_IP:8081/
@@ -223,7 +266,7 @@ exit /b 0
 
 :create_zip
 echo.
-echo [3/3] Creating ZIP archive...
+echo [4/4] Creating ZIP archive...
 if exist "%ZIP_PATH%" del /f /q "%ZIP_PATH%"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -LiteralPath '%STAGE_DIR%' -DestinationPath '%ZIP_PATH%' -Force"
 if errorlevel 1 (
