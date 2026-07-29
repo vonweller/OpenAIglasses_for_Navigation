@@ -1,5 +1,5 @@
-// ===== all_in_one_merged.ino 鈥?XIAO ESP32S3 Sense: Camera + Mic (PDM) + IMU (ICM42688 SPI) =====
-// ===== 鐗堟湰: v2.4-SPIIMU - ICM42688 鏀逛负 SPI锛岄伩寮€ I2S 骞叉壈锛沇AV chunked 鎾斁淇濇寔 =====
+// ===== all_in_one_merged.ino — XIAO ESP32S3 Sense: Camera + Mic (PDM) + IMU (ICM42688 SPI) =====
+// ===== 版本: v2.4-SPIIMU - ICM42688 改为 SPI，避开 I2S 干扰；保留 WAV 分块播放 =====
 
 #include <WiFi.h>
 #include <esp_wifi.h>
@@ -12,13 +12,13 @@ struct WavFmt;
 #include <cstring>      // memcmp
 #include <WiFiUdp.h>
 #include <WiFiClient.h> 
-#include <SPI.h>        // <<< 鏀规垚 SPI
+#include <SPI.h>        // ICM42688 使用 SPI
 using namespace websockets;
 
 // ===== WiFi / Server =====
 const char* WIFI_SSID   = "LYT";
 const char* WIFI_PASS   = "lyt13509018386";
-const char* SERVER_HOST = "192.168.10.37";
+const char* SERVER_HOST = "192.168.10.6";
 const uint16_t SERVER_PORT = 8081;
 
 static const char* CAM_WS_PATH = "/ws/camera";
@@ -31,14 +31,14 @@ static const char* AUD_WS_PATH = "/ws_audio";
 framesize_t g_frame_size = FRAMESIZE_VGA;
 #define JPEG_QUALITY  17
 #define FB_COUNT      2
-volatile int g_target_fps = 0; // 鏂板锛?=涓嶉檺锛?0 鍒欐寜璇PS闄愰€熷彂閫?
+volatile int g_target_fps = 0; // 0=不限速，>0 时按指定 FPS 限速发送
 
-// 銆愭柊澧炪€戣棰戜紶杈撴€ц兘鐩戞帶
-volatile unsigned long frame_captured_count = 0;  // 閲囬泦甯ц鏁?
-volatile unsigned long frame_sent_count = 0;      // 鍙戦€佸抚璁℃暟
-volatile unsigned long frame_dropped_count = 0;   // 涓㈠純甯ц鏁?
-volatile unsigned long last_stats_time = 0;       // 涓婃缁熻鏃堕棿
-volatile unsigned long ws_send_fail_count = 0;    // WebSocket鍙戦€佸け璐ヨ鏁?
+// 视频传输性能监控
+volatile unsigned long frame_captured_count = 0;  // 采集帧计数
+volatile unsigned long frame_sent_count = 0;      // 发送帧计数
+volatile unsigned long frame_dropped_count = 0;   // 丢弃帧计数
+volatile unsigned long last_stats_time = 0;       // 上次统计时间
+volatile unsigned long ws_send_fail_count = 0;    // WebSocket 发送失败计数
 
 // ===== Mic (PDM RX) =====
 #define I2S_MIC_CLOCK_PIN 42
@@ -48,19 +48,19 @@ const int CHUNK_MS        = 20;
 const int BYTES_PER_CHUNK = SAMPLE_RATE * CHUNK_MS / 1000 * 2;
 const int AUDIO_QUEUE_DEPTH = 10;
 
-// ===== Speaker (I2S TX 鈫?MAX98357A) =====
+// ===== Speaker (I2S TX → MAX98357A) =====
 #define I2S_SPK_BCLK 7
 #define I2S_SPK_LRCK 8
 #define I2S_SPK_DIN  9
 const int TTS_RATE = 16000;
 
 // ===== IMU (ICM42688 over SPI) / UDP =====
-// 浣跨敤 D0~D3 浣滀负 SPI
+// 使用 D0~D3 作为 SPI
 #define IMU_SPI_SCK   1   // D0
 #define IMU_SPI_MOSI  2   // D1
 #define IMU_SPI_MISO  3   // D2
 #define IMU_SPI_CS    4   // D3
-const char* UDP_HOST  = "192.168.10.15";
+const char* UDP_HOST  = SERVER_HOST; // IMU 数据发送到同一台后端服务器
 const int   UDP_PORT  = 12345;
 
 WiFiUDP udp;
@@ -70,7 +70,7 @@ WebsocketsClient wsCam;
 WebsocketsClient wsAud;
 volatile bool cam_ws_ready = false;
 volatile bool aud_ws_ready = false;
-volatile bool snapshot_in_progress = false; // 鎶撴媿鏈熼棿鏆傚仠瀹炴椂閲囬泦
+volatile bool snapshot_in_progress = false; // 抓拍期间暂停实时采集
 
 typedef camera_fb_t* fb_ptr_t;
 QueueHandle_t qFrames;
@@ -160,12 +160,12 @@ bool init_camera() {
 inline void enqueue_frame(camera_fb_t* fb) {
   if (!fb) return;
   if (xQueueSend(qFrames, &fb, 0) != pdPASS) {
-    // 闃熷垪婊★紝涓㈠純鏈€鏃х殑甯?
+    // 队列已满，丢弃最旧的帧
     fb_ptr_t drop = nullptr;
     if (xQueueReceive(qFrames, &drop, 0) == pdPASS) {
       if (drop) {
         esp_camera_fb_return(drop);
-        frame_dropped_count++;  // 缁熻涓㈠抚
+        frame_dropped_count++;  // 统计丢帧
       }
     }
     xQueueSend(qFrames, &fb, 0);
@@ -195,14 +195,14 @@ void taskCamCapture(void*) {
         vTaskDelay(pdMS_TO_TICKS(2));
       }
       
-      // 姣?绉掓墦鍗颁竴娆￠噰闆嗙粺璁?
+      // 每 5 秒打印一次采集统计
       unsigned long now = millis();
       if (now - last_log > 5000) {
         int queue_waiting = uxQueueMessagesWaiting(qFrames);
         Serial.printf("[CAM-CAP] captured=%lu, queue=%d, fail=%lu\n", 
                       frame_captured_count, queue_waiting, capture_fail_count);
         last_log = now;
-        capture_fail_count = 0;  // 閲嶇疆澶辫触璁℃暟
+        capture_fail_count = 0;  // 重置失败计数
       }
     } else {
       vTaskDelay(pdMS_TO_TICKS(20));
@@ -220,7 +220,7 @@ void taskCamSend(void*) {
     fb_ptr_t fb = nullptr;
     if (xQueueReceive(qFrames, &fb, pdMS_TO_TICKS(100)) == pdPASS) {
       if (fb && cam_ws_ready) {
-        // 鍙戦€佽妭娴侊細鑻ヨ缃簡鐩爣FPS锛屽垯鎸夊懆鏈熷彂锛屼涪寮冨浣欏抚鐢?qFrames 鏈哄埗鎵挎媴
+        // 发送节流：设置目标 FPS 后按周期发送，多余帧由 qFrames 机制丢弃
         if (g_target_fps > 0) {
           const int period_ms = 1000 / g_target_fps;
           TickType_t now = xTaskGetTickCount();
@@ -237,7 +237,7 @@ void taskCamSend(void*) {
           frame_sent_count++;
           last_sent_time = millis();
           
-          // 鐩戞帶鍙戦€佽€楁椂
+          // 监控发送耗时
           if (send_time > 100) {
             Serial.printf("[CAM-SEND] WARNING: send took %lu ms (size=%u)\n", send_time, fb->len);
           }
@@ -252,7 +252,7 @@ void taskCamSend(void*) {
         
         esp_camera_fb_return(fb);
         
-        // 姣?绉掓墦鍗颁竴娆″彂閫佺粺璁?
+        // 每 5 秒打印一次发送统计
         unsigned long now = millis();
         if (now - last_log > 5000) {
           unsigned long gap = now - last_sent_time;
@@ -265,7 +265,7 @@ void taskCamSend(void*) {
         esp_camera_fb_return(fb); 
       }
     } else {
-      // 闃熷垪鎺ユ敹瓒呮椂锛屾鏌ユ槸鍚﹂暱鏃堕棿娌℃湁甯?
+      // 队列接收超时，检查是否长时间没有帧
       unsigned long now = millis();
       if (cam_ws_ready && last_sent_time > 0 && (now - last_sent_time) > 3000) {
         Serial.printf("[CAM-SEND] WARNING: No frame sent for %lu ms\n", now - last_sent_time);
@@ -352,7 +352,7 @@ static inline void mono16_to_stereo32_msb(const int16_t* in, size_t nSamp, int32
   }
 }
 
-// === chunked 璇诲彇杈呭姪 ===
+// === chunked 读取辅助 ===
 static bool read_line(WiFiClient& cli, String& line, uint32_t timeout_ms=3000){
   line = "";
   uint32_t t0 = millis();
@@ -473,7 +473,7 @@ static bool parse_wav_header(WiFiClient& cli, WavFmt& fmt, uint32_t& dataRemaini
   }
 }
 
-// ---- HTTP 鎾斁浠诲姟
+// ---- HTTP 播放任务
 static TaskHandle_t taskHttpPlayHandle = nullptr;
 static volatile bool http_play_running = false;
 
@@ -643,7 +643,7 @@ void taskHttpPlay(void*){
 
     static uint32_t current_out_rate = 0;
     if (current_out_rate != sampleRate) {
-      // 閲嶆柊閰嶇疆I2S杈撳嚭閲囨牱鐜囦互鍖归厤鏈嶅姟绔疻AV
+      // 重新配置 I2S 输出采样率，以匹配服务端 WAV
       i2sOut.begin(I2S_MODE_STD, (int)sampleRate, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO);
       current_out_rate = sampleRate;
       Serial.printf("[I2S OUT] reconfig to %u Hz\n", sampleRate);
@@ -653,7 +653,7 @@ void taskHttpPlay(void*){
       uint8_t inbuf[2048];
       size_t  filled = 0;
 
-      // 鏍规嵁閲囨牱鐜囪绠?0ms瀛楄妭鏁帮紙mono,16bit锛?
+      // 根据采样率计算 20 ms 字节数（单声道、16 bit）
       uint32_t bytes20 = (sampleRate * 2 * 20) / 1000; // 16k=640,12k=480,8k=320
       if (bytes20 < 2) bytes20 = 2;
 
@@ -703,7 +703,7 @@ void stopStreamWav(){
 }
 
 // ====================================================================
-// TTS锛堜簩杩涘埗鍒嗙墖锛変繚鐣欎絾榛樿涓嶅惎鐢?
+// TTS（二进制分片）保留，但默认不启用
 // ====================================================================
 void taskTTSPlay(void*){
   static int32_t stereo32Buf[1024*2];
@@ -757,11 +757,11 @@ inline void tts_reset_queue(){ if (qTTS) xQueueReset(qTTS); }
 #define BURST_FIRST       REG_TEMP_H
 #define BURST_COUNT       14
 
-// scale (甯歌榛樿涓?卤16g / 卤2000 dps)
+// 量程（常见默认值为 ±16g / ±2000 dps）
 static const float ACC_LSB_PER_G   = 2048.0f;   // 1 g = 2048 LSB
 static const float GYR_LSB_PER_DPS = 16.4f;     // 1 dps = 16.4 LSB
 static const float G               = 9.80665f;
-static const float TEMP_SENS       = 132.48f;   // 掳C/LSB
+static const float TEMP_SENS       = 132.48f;   // °C/LSB
 static const float TEMP_OFFSET     = 25.0f;
 
 static inline void imu_cs_low()  { digitalWrite(IMU_SPI_CS, LOW);  }
@@ -829,7 +829,7 @@ bool imu_read_once(float& tempC, float& ax, float& ay, float& az, float& gx, flo
   return true;
 }
 
-// 杞诲井骞虫粦锛屼究浜庤瀵燂紱涓嶆敼鍙?UDP 瀛楁鍚?
+// 轻微平滑，便于观察；不改变 UDP 字段名
 static const float EMA_ALPHA = 0.20f;
 bool  ema_inited = false;
 float ax_f=0, ay_f=0, az_f=0;
@@ -897,7 +897,7 @@ void setup() {
   init_i2s_in();
   init_i2s_out();
 
-  qFrames = xQueueCreate(3, sizeof(fb_ptr_t));  // 澧炲姞鍒?涓紦鍐诧紝鍑忓皯涓㈠抚
+  qFrames = xQueueCreate(3, sizeof(fb_ptr_t));  // 使用 3 个缓冲，减少丢帧
   qAudio  = xQueueCreate(AUDIO_QUEUE_DEPTH, sizeof(AudioChunk));
   qTTS    = xQueueCreate(TTS_QUEUE_DEPTH, sizeof(TTSChunk));
 
@@ -912,7 +912,7 @@ void setup() {
     if (ev == WebsocketsEvent::ConnectionOpened)  { 
       cam_ws_ready = true;  
       Serial.println("[WS-CAM] open");
-      // 閲嶇疆缁熻
+      // 重置统计
       frame_sent_count = 0;
       frame_dropped_count = 0;
       ws_send_fail_count = 0;
@@ -938,13 +938,13 @@ void setup() {
         if (apply_framesize(fs)) Serial.printf("[CAM] framesize set to %s\n", v.c_str());
         else Serial.printf("[CAM] framesize set failed: %s\n", v.c_str());
       }
-      else if (cmd.startsWith("SET:QUALITY=")) {     // 鏂板锛氬姩鎬佺敾璐?
+      else if (cmd.startsWith("SET:QUALITY=")) {     // 动态调整画质
         int q = cmd.substring(strlen("SET:QUALITY=")).toInt();
         q = constrain(q, 5, 40);
         sensor_t* s = esp_camera_sensor_get();
         if (s) { s->set_quality(s, q); Serial.printf("[CAM] quality=%d\n", q); }
       }
-      else if (cmd.startsWith("SET:FPS=")) {         // 鏂板锛氬彂閫佽妭娴丗PS
+      else if (cmd.startsWith("SET:FPS=")) {         // 动态调整发送 FPS
         int f = cmd.substring(strlen("SET:FPS=")).toInt();
         g_target_fps = (f <= 0 ? 0 : constrain(f, 5, 60));
         Serial.printf("[CAM] target_fps=%d\n", g_target_fps);
@@ -957,11 +957,11 @@ void setup() {
         sensor_t* s = esp_camera_sensor_get();
         framesize_t old_fs = g_frame_size;
         int old_q = JPEG_QUALITY;
-        // 鐩爣鍒嗚鲸鐜囷細XGA锛堣嫢闇€鏇撮珮鍙敼涓?SXGA/UXGA锛岃PSRAM绋冲畾鎬э級
+        // 目标分辨率：SXGA；更高分辨率需根据 PSRAM 稳定性调整
         framesize_t target_fs = FRAMESIZE_SXGA;
         if (s) {
           s->set_framesize(s, target_fs);
-          s->set_quality(s, 18); // 鏁板€艰秺灏忚秺娓呮櫚
+          s->set_quality(s, 18); // 数值越小越清晰
         }
         vTaskDelay(pdMS_TO_TICKS(500));
         camera_fb_t* fb = esp_camera_fb_get();
