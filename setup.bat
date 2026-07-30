@@ -38,7 +38,48 @@ call :detect_gpu
 call :get_local_ip
 
 if "%CHECK_ONLY%"=="1" (
+    set "CHECK_FAILED=0"
+    set "PY=%CD%\%VENV_DIR%\Scripts\python.exe"
     echo.
+    echo [CHECK] Verifying required project files...
+    for %%F in (
+        "app_main.py"
+        "requirements.txt"
+        "aiglasses\app_main.py"
+        "aiglasses\performance.py"
+        "aiglasses\audio_stream.py"
+        "tools\desktop_esp32_simulator.py"
+        "static\main.js"
+        "templates\index.html"
+    ) do (
+        if exist "%%~F" (
+            echo [OK] %%~F
+        ) else (
+            echo [ERROR] Missing required file: %%~F
+            set "CHECK_FAILED=1"
+        )
+    )
+
+    if exist "!PY!" (
+        echo.
+        echo [CHECK] Verifying existing %VENV_DIR% dependencies...
+        call :check_runtime_deps
+        if errorlevel 1 (
+            echo [ERROR] Existing environment is missing or has incompatible dependencies.
+            echo         Run setup.bat --reinstall to repair it.
+            set "CHECK_FAILED=1"
+        ) else (
+            echo [OK] Existing runtime dependencies are ready.
+        )
+    ) else (
+        echo [INFO] %VENV_DIR% does not exist yet. Normal setup will create it.
+    )
+
+    echo.
+    if "!CHECK_FAILED!"=="1" (
+        echo [ERROR] Check finished with problems. No install or startup was performed.
+        exit /b 1
+    )
     echo [OK] Check finished. No install or startup was performed.
     echo      Local UI:     http://127.0.0.1:%PORT%/
     echo      LAN UI:       http://%LOCAL_IP%:%PORT%/
@@ -77,6 +118,10 @@ echo Audio WS:     ws://%LOCAL_IP%:%PORT%/ws_audio
 echo IMU WS:       ws://%LOCAL_IP%:%PORT%/ws
 echo Logs:         %CD%\logs\backend.stdout.log
 echo Errors:       %CD%\logs\backend.stderr.log
+echo.
+echo Desktop simulator:
+echo   "%PY%" tools\desktop_esp32_simulator.py --host 127.0.0.1 --port %PORT%
+echo   Add --synthetic when no local camera is available.
 echo.
 echo Optional commands:
 echo   setup.bat --check       Environment check only
@@ -268,7 +313,7 @@ if errorlevel 1 (
 exit /b 0
 
 :check_runtime_deps
-"%PY%" -c "import inspect, sys, fastapi, uvicorn, cv2, numpy, PIL, ultralytics, torch, mediapipe, dashscope, openai, dotenv, modelscope, clip, lap; from openai import OpenAI; c=OpenAI(api_key='dependency-check', base_url='https://dashscope.aliyuncs.com/compatible-mode/v1'); sig=str(inspect.signature(c.chat.completions.create)); bad=(sys.prefix == sys.base_prefix or not (ultralytics.__version__ == '8.4.88') or 'modalities' not in sig or 'audio' not in sig); raise SystemExit(1 if bad else 0)" >nul 2>nul
+"%PY%" -c "import inspect, sys, fastapi, uvicorn, websockets, cv2, numpy, PIL, ultralytics, torch, mediapipe, dashscope, openai, dotenv, modelscope, clip, lap, sounddevice; from openai import OpenAI; c=OpenAI(api_key='dependency-check', base_url='https://dashscope.aliyuncs.com/compatible-mode/v1'); sig=str(inspect.signature(c.chat.completions.create)); bad=(sys.prefix == sys.base_prefix or not (ultralytics.__version__ == '8.4.88') or 'modalities' not in sig or 'audio' not in sig); raise SystemExit(1 if bad else 0)" >nul 2>nul
 exit /b %ERRORLEVEL%
 
 :ensure_runtime_files
