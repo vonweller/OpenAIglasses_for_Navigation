@@ -8,7 +8,7 @@ import asyncio
 import threading
 import queue
 import time
-from .audio_stream import broadcast_pcm16_realtime
+from .audio_stream import broadcast_pcm16_realtime, finish_pcm16_stream
 from .audio_compressor import compressed_audio_cache, AudioCompressor
 from .paths import VOICE_DIR as PROJECT_VOICE_DIR
 
@@ -234,6 +234,7 @@ async def _broadcast_audio_optimized(pcm_data: bytes):
 
         # 单次调用交给底层 pacing（20ms节拍在 broadcast_pcm16_realtime 内部实现）
         await broadcast_pcm16_realtime(full_audio)
+        await finish_pcm16_stream()
 
         _last_play_ts = time.monotonic()
     except Exception as e:

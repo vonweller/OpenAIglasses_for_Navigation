@@ -3,13 +3,18 @@
 import threading
 from collections import deque
 import time
+from dataclasses import dataclass
 import cv2
 import numpy as np
 
 # 原始JPEG帧缓冲（只保留最新 N 帧）
-_MAX_BUF = 4
+_MAX_BUF = 1
 _frames = deque(maxlen=_MAX_BUF)
 _cond = threading.Condition()
+_frame_seq = 0
+_frame_drop_count = 0
+_last_frame_at = None
+_consumer_state = threading.local()
 
 # 向前端发送JPEG的回调，由 app_main.py 在启动时注册
 _sender_lock = threading.Lock()
@@ -35,6 +40,13 @@ _yolo_status = {
     "updated_at": None,
 }
 
+
+@dataclass(frozen=True)
+class RawFrame:
+    seq: int
+    captured_at: float
+    bgr: np.ndarray
+
 def set_sender(cb):
     """由 app_main.py 调用，注册一个函数：cb(jpeg_bytes)->None"""
     global _sender_cb
@@ -59,34 +71,65 @@ def get_yolo_status():
 
 def push_raw_jpeg(jpeg_bytes: bytes):
     """由 app_main.py 在收到 /ws/camera 帧时调用"""
+    global _frame_seq, _frame_drop_count, _last_frame_at
     if not jpeg_bytes:
         return
     with _cond:
-        _frames.append((time.time(), jpeg_bytes))
+        if _frames:
+            _frame_drop_count += 1
+        now = time.time()
+        _frame_seq += 1
+        _last_frame_at = now
+        _frames.append((_frame_seq, now, jpeg_bytes))
         _cond.notify_all()
 
-def wait_raw_bgr(timeout_sec: float = 0.5):
-    """被 YOLO/MediaPipe 脚本调用：等待并拿到最新一帧BGR；超时返回 None"""
+
+def clear_raw_frames():
+    """摄像头断开或管线重置时清除旧画面。"""
+    with _cond:
+        _frames.clear()
+        _cond.notify_all()
+
+
+def get_frame_stats():
+    with _cond:
+        return {
+            "latest_seq": _frame_seq,
+            "last_frame_at": _last_frame_at,
+            "buffered": len(_frames),
+            "dropped": _frame_drop_count,
+        }
+
+
+def wait_next_raw_bgr(last_seq: int = 0, timeout_sec: float = 0.5):
+    """等待序号大于 ``last_seq`` 的新画面，超时返回 None。"""
     t_end = time.time() + timeout_sec
-    last = None
     while time.time() < t_end:
         with _cond:
-            if _frames:
-                last = _frames[-1]
-        if last is None:
-            time.sleep(0.01)
-            continue
+            if _frames and _frames[-1][0] > last_seq:
+                seq, ts, jpeg = _frames[-1]
+            else:
+                remaining = max(0.0, t_end - time.time())
+                _cond.wait(timeout=min(0.05, remaining))
+                continue
         # 解码JPEG为BGR
-        ts, jpeg = last
         arr = np.frombuffer(jpeg, dtype=np.uint8)
         bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if bgr is not None:
-            # 在最源头进行镜像处理
-            #bgr = cv2.flip(bgr, 1)
-            return bgr
+            return RawFrame(seq=seq, captured_at=ts, bgr=bgr)
         # 解码失败，稍等重试
         time.sleep(0.01)
     return None
+
+
+def wait_raw_bgr(timeout_sec: float = 0.5):
+    """兼容旧调用；新循环应使用 wait_next_raw_bgr 并保存序号。"""
+    last_seq = int(getattr(_consumer_state, "last_seq", 0))
+    packet = wait_next_raw_bgr(last_seq=last_seq, timeout_sec=timeout_sec)
+    if packet is None:
+        return None
+    _consumer_state.last_seq = packet.seq
+    return packet.bgr
 
 def send_vis_bgr(bgr, quality: int = 80):
     """被 YOLO/MediaPipe 脚本调用：把处理后画面推给前端 viewer"""

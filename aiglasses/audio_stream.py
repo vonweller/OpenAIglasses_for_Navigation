@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 import asyncio
 import os
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 
@@ -13,8 +14,11 @@ STREAM_CH = 1
 STREAM_SW = 2
 BYTES_PER_20MS_16K = STREAM_SR * STREAM_SW * 20 // 1000
 STREAM_IDLE_SILENCE = b"\x00" * BYTES_PER_20MS_16K
-STREAM_QUEUE_MAX = int(os.getenv("AIGLASS_STREAM_QUEUE_MAX", "160"))
-STREAM_PREROLL_CHUNKS = max(0, int(os.getenv("AIGLASS_STREAM_PREROLL_CHUNKS", "10")))
+STREAM_QUEUE_MAX = int(os.getenv("AIGLASS_STREAM_QUEUE_MAX", "240"))
+STREAM_PREROLL_CHUNKS = max(0, int(os.getenv("AIGLASS_STREAM_PREROLL_CHUNKS", "3")))
+STREAM_START_BUFFER_CHUNKS = max(1, int(os.getenv("AIGLASS_STREAM_START_BUFFER_CHUNKS", "8")))
+STREAM_REBUFFER_CHUNKS = max(1, int(os.getenv("AIGLASS_STREAM_REBUFFER_CHUNKS", "4")))
+STREAM_KEEPALIVE_SEC = max(1.0, float(os.getenv("AIGLASS_STREAM_KEEPALIVE_SEC", "5")))
 
 current_ai_task: Optional[asyncio.Task] = None
 
@@ -42,12 +46,15 @@ def is_playing_now() -> bool:
 class StreamClient:
     q: asyncio.Queue
     abort_event: asyncio.Event
+    flush_event: asyncio.Event
 
 
 stream_clients: "Set[StreamClient]" = set()
 last_broadcast_at: Optional[float] = None
 last_broadcast_bytes: int = 0
 total_broadcast_bytes: int = 0
+_pcm_buffer_lock = threading.Lock()
+_pending_pcm16 = bytearray()
 
 
 def _wav_header_unknown_size(sr=STREAM_SR, ch=STREAM_CH, sw=STREAM_SW) -> bytes:
@@ -84,6 +91,8 @@ async def hard_reset_audio(reason: str = ""):
     stream_clients.clear()
 
     await cancel_current_ai()
+    with _pcm_buffer_lock:
+        _pending_pcm16.clear()
 
     if reason:
         print(f"[HARD-RESET] {reason}")
@@ -91,6 +100,8 @@ async def hard_reset_audio(reason: str = ""):
 
 async def soft_reset_audio(reason: str = ""):
     await cancel_current_ai()
+    with _pcm_buffer_lock:
+        _pending_pcm16.clear()
     for sc in list(stream_clients):
         if sc.abort_event.is_set():
             continue
@@ -101,8 +112,30 @@ async def soft_reset_audio(reason: str = ""):
             pass
         except Exception:
             pass
+        sc.flush_event.clear()
     if reason:
         print(f"[SOFT-RESET] {reason}")
+
+
+def _enqueue_pcm_piece(piece: bytes) -> None:
+    if not piece:
+        return
+    dead: List[StreamClient] = []
+    for sc in list(stream_clients):
+        if sc.abort_event.is_set():
+            dead.append(sc)
+            continue
+        try:
+            if sc.q.full():
+                try:
+                    sc.q.get_nowait()
+                except Exception:
+                    pass
+            sc.q.put_nowait(piece)
+        except Exception:
+            dead.append(sc)
+    for sc in dead:
+        stream_clients.discard(sc)
 
 
 async def broadcast_pcm16_realtime(pcm16: bytes):
@@ -121,40 +154,30 @@ async def broadcast_pcm16_realtime(pcm16: bytes):
     except Exception:
         pass
 
-    loop = asyncio.get_event_loop()
-    next_tick = loop.time()
-    off = 0
-    while off < len(pcm16):
-        take = min(BYTES_PER_20MS_16K, len(pcm16) - off)
-        piece = pcm16[off : off + take]
+    # Network fragments rarely align to 20 ms. Preserve the remainder instead
+    # of padding each fragment with silence, which caused audible dropouts.
+    ready: List[bytes] = []
+    with _pcm_buffer_lock:
+        _pending_pcm16.extend(pcm16)
+        while len(_pending_pcm16) >= BYTES_PER_20MS_16K:
+            ready.append(bytes(_pending_pcm16[:BYTES_PER_20MS_16K]))
+            del _pending_pcm16[:BYTES_PER_20MS_16K]
+    for piece in ready:
+        _enqueue_pcm_piece(piece)
 
-        dead: List[StreamClient] = []
-        for sc in list(stream_clients):
-            if sc.abort_event.is_set():
-                dead.append(sc)
-                continue
-            try:
-                if sc.q.full():
-                    try:
-                        sc.q.get_nowait()
-                    except Exception:
-                        pass
-                sc.q.put_nowait(piece)
-            except Exception:
-                dead.append(sc)
-        for sc in dead:
-            try:
-                stream_clients.discard(sc)
-            except Exception:
-                pass
 
-        next_tick += 0.020
-        now = loop.time()
-        if now < next_tick:
-            await asyncio.sleep(next_tick - now)
-        else:
-            next_tick = now
-        off += take
+async def finish_pcm16_stream() -> None:
+    """Flush the final partial audio frame once at the end of a response."""
+    with _pcm_buffer_lock:
+        piece = bytes(_pending_pcm16)
+        _pending_pcm16.clear()
+    if piece and len(piece) < BYTES_PER_20MS_16K:
+        piece += b"\x00" * (BYTES_PER_20MS_16K - len(piece))
+    if piece:
+        _enqueue_pcm_piece(piece)
+    for sc in list(stream_clients):
+        if not sc.abort_event.is_set():
+            sc.flush_event.set()
 
 
 def get_stream_status() -> Dict[str, Any]:
@@ -181,7 +204,8 @@ def register_stream_route(app):
 
         q: "asyncio.Queue[bytes | None]" = asyncio.Queue(maxsize=STREAM_QUEUE_MAX)
         abort_event = asyncio.Event()
-        sc = StreamClient(q=q, abort_event=abort_event)
+        flush_event = asyncio.Event()
+        sc = StreamClient(q=q, abort_event=abort_event, flush_event=flush_event)
         stream_clients.add(sc)
 
         async def gen():
@@ -193,18 +217,55 @@ def register_stream_route(app):
                     yield STREAM_IDLE_SILENCE
                     await asyncio.sleep(0.020)
 
+                # 等待积累少量真实语音，再以固定 20ms 节拍播放，抵御上游分片抖动。
+                buffered = False
+                started_once = False
+                next_tick = asyncio.get_running_loop().time()
+                last_yield_at = next_tick
                 while True:
                     if abort_event.is_set():
                         break
+                    if flush_event.is_set() and q.empty():
+                        flush_event.clear()
+                        buffered = False
+                    if not buffered:
+                        target = (
+                            1
+                            if flush_event.is_set()
+                            else (STREAM_REBUFFER_CHUNKS if started_once else STREAM_START_BUFFER_CHUNKS)
+                        )
+                        if q.qsize() >= target:
+                            buffered = True
+                            started_once = True
+                            next_tick = asyncio.get_running_loop().time()
+                        else:
+                            # Do not shield Event.wait() here: every timeout would
+                            # leave an orphan task and eventually stall the server.
+                            now = asyncio.get_running_loop().time()
+                            if now - last_yield_at >= STREAM_KEEPALIVE_SEC:
+                                yield STREAM_IDLE_SILENCE
+                                last_yield_at = now
+                            await asyncio.sleep(0.010)
+                            continue
                     try:
-                        chunk = await asyncio.wait_for(q.get(), timeout=0.020)
-                    except asyncio.TimeoutError:
-                        chunk = STREAM_IDLE_SILENCE
+                        chunk = q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        buffered = False
+                        continue
                     if abort_event.is_set():
                         break
                     if chunk is None:
                         continue
                     yield chunk or STREAM_IDLE_SILENCE
+                    last_yield_at = asyncio.get_running_loop().time()
+                    next_tick += 0.020
+                    delay = next_tick - asyncio.get_running_loop().time()
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    else:
+                        next_tick = asyncio.get_running_loop().time()
+                    if q.empty() and not flush_event.is_set():
+                        buffered = False
             finally:
                 stream_clients.discard(sc)
 

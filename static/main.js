@@ -10,6 +10,9 @@
   const $yoloStatus = document.getElementById('yoloStatus');
   const $modeStatus = document.getElementById('modeStatus');
   const $speakerStatus = document.getElementById('speakerStatus');
+  const $modelStatus = document.getElementById('modelStatus');
+  const $targetStatus = document.getElementById('targetStatus');
+  const $inferenceStatus = document.getElementById('inferenceStatus');
   const $stageEmpty = document.getElementById('stageEmpty');
   const $partial   = document.getElementById('partial');
   const $finalList = document.getElementById('finalList');
@@ -18,6 +21,7 @@
   const $serverHostInput = document.getElementById('serverHostInput');
   const $serverHostOptions = document.getElementById('serverHostOptions');
   const $dashscopeKeyInput = document.getElementById('dashscopeKeyInput');
+  const $performanceProfileInput = document.getElementById('performanceProfileInput');
   const $blindPathModelInput = document.getElementById('blindPathModelInput');
   const $obstacleModelInput = document.getElementById('obstacleModelInput');
   const $itemModelInput = document.getElementById('itemModelInput');
@@ -29,6 +33,14 @@
   const $audioWsText = document.getElementById('audioWsText');
   const $imuUdpText = document.getElementById('imuUdpText');
   const $fps       = document.getElementById('fps');
+  const $captureFps = document.getElementById('captureFps');
+  const $processFps = document.getElementById('processFps');
+  const $broadcastFps = document.getElementById('broadcastFps');
+  const $inferenceFps = document.getElementById('inferenceFps');
+  const $inferenceMs = document.getElementById('inferenceMs');
+  const $latencyMs = document.getElementById('latencyMs');
+  const $outputDrops = document.getElementById('outputDrops');
+  const $deviceMetrics = document.getElementById('deviceMetrics');
   const canvas     = document.getElementById('canvas');
   const ctx        = canvas.getContext('2d');
 
@@ -227,51 +239,156 @@
     el.className = 'badge ' + (tone || (ok ? 'ok' : 'err'));
   }
 
+  const MODE_LABELS = {
+    IDLE: '空闲',
+    CHAT: '对话',
+    ITEM_SEARCH: '寻找物品',
+    BLINDPATH_NAV: '盲道导航',
+    SEEKING_CROSSWALK: '寻找斑马线',
+    WAIT_TRAFFIC_LIGHT: '等待信号灯',
+    CROSSING: '正在过马路',
+    SEEKING_NEXT_BLINDPATH: '寻找下一段盲道',
+    TRAFFIC_LIGHT_DETECTION: '红绿灯检测',
+    RECOVERY: '恢复定位',
+    UNKNOWN: '未知',
+  };
+  let localDecodeDrops = 0;
+  let lastInferenceCount = 0;
+  let lastInferenceAt = performance.now();
+  let measuredInferenceFps = 0;
+
+  function phaseText(data) {
+    const yolo = data?.yolo || {};
+    const phase = String(yolo.phase || 'idle');
+    const target = String(yolo.target_zh || data?.item_search_target || yolo.target || '').trim();
+    const quoted = target ? `“${target}”` : '当前目标';
+    const detections = Number(yolo.detections || 0);
+    const err = String(yolo.last_error || '').trim();
+    if (!data?.camera_connected && data?.item_search_running) return `摄像头已断开，寻找${quoted}已暂停`;
+    if (phase === 'lazy_prewarm' || phase === 'starting' || phase === 'loading' || phase === 'text_features') {
+      return `正在准备${quoted}识别特征`;
+    }
+    if (phase === 'camera_waiting') return `摄像头已断开，寻找${quoted}已暂停`;
+    if (phase === 'infer') {
+      return detections > 0 ? `已检测到${quoted}，正在锁定` : `正在推理：寻找${quoted}`;
+    }
+    if (phase === 'result_miss') return `本轮推理完成，暂未发现${quoted}`;
+    if (phase === 'detected') return `已检测到${quoted}，正在锁定`;
+    if (phase === 'tracking' || String(yolo.mode || '').toUpperCase() === 'TRACK') {
+      return `正在跟踪${quoted}，请移动手靠近`;
+    }
+    if (phase === 'completed') return `寻找完成：${target || '目标物品'}`;
+    if (phase === 'result') return `本轮推理完成：${target || '视觉目标'}`;
+    if (phase === 'ready') return `识别模型已就绪，准备寻找${quoted}`;
+    if (phase === 'failed' || phase === 'lazy_prewarm_failed') {
+      return `视觉推理失败：${err ? err.slice(0, 64) : '模型运行异常'}`;
+    }
+    if (phase === 'stopping') return '正在停止视觉推理';
+    if (phase === 'stopped') return '视觉推理已停止';
+    return data?.camera_connected ? '视觉推理空闲' : '系统已就绪，等待摄像头画面';
+  }
+
   function updateYoloBadge(data){
     const yolo = data?.yolo || {};
-    const phase = yolo.phase || 'idle';
-    const target = yolo.target ? ` ${yolo.target}` : '';
-    const device = yolo.device ? ` / ${yolo.device}` : '';
-    const detections = Number.isFinite(Number(yolo.detections)) ? ` det:${Number(yolo.detections)}` : '';
-    const err = yolo.last_error || '';
-    let tone = 'warn';
-    let text = `YOLO: ${phase}${target}${device}${detections}`;
-    if (phase === 'idle' || phase === 'stopped') {
-      tone = '';
-      text = 'YOLO: idle';
-    } else if (phase === 'failed') {
-      tone = 'err';
-      text = `YOLO error: ${err ? err.slice(0, 48) : 'failed'}`;
-    } else if (phase === 'infer' || phase === 'ready') {
-      tone = 'ok';
-    }
-    setBadge($yoloStatusStage, tone === 'ok', text, tone);
-    setBadge($yoloStatus, tone === 'ok', text, tone);
+    const phase = String(yolo.phase || 'idle');
+    const target = String(yolo.target_zh || data?.item_search_target || yolo.target || '').trim();
+    const backend = String(yolo.backend || '').trim();
+    const deviceRaw = String(yolo.device || '').toLowerCase();
+    const device = deviceRaw.includes('cuda') ? 'GPU' : (deviceRaw ? 'CPU' : '');
+    const active = !['idle', 'stopped', 'completed'].includes(phase);
+    const failed = phase === 'failed' || phase === 'lazy_prewarm_failed';
+    const summary = phaseText(data);
+    const tone = failed ? 'err' : (active ? 'ok' : '');
+    setBadge($yoloStatusStage, active, `视觉推理：${summary}`, tone);
+    setBadge($yoloStatus, active, `视觉推理：${summary}`, tone);
+    setBadge($modelStatus, Boolean(backend), `视觉模型：${backend || '空闲'}${device ? ` / ${device}` : ''}`, failed ? 'err' : (backend ? 'ok' : ''));
+    setBadge($targetStatus, Boolean(target), `推理目标：${target || '无'}`, target ? 'warn' : '');
+    if ($inferenceStatus) $inferenceStatus.textContent = summary;
   }
 
   function updateModeAndSpeaker(data){
     const mode = data?.item_search_running ? 'ITEM_SEARCH' : (data?.mode || 'CHAT');
+    const modeText = MODE_LABELS[mode] || mode;
     const modeTone = mode === 'CHAT' || mode === 'IDLE' ? '' : 'warn';
-    setBadge($modeStatus, modeTone !== 'warn', `Mode: ${mode}`, modeTone);
+    setBadge($modeStatus, modeTone !== 'warn', `运行模式：${modeText}`, modeTone);
 
     const stream = data?.audio_stream || {};
     const clients = Number(stream.clients || 0);
     const age = stream.last_broadcast_age_sec;
-    let text = clients > 0 ? `Speaker: connected (${clients})` : 'Speaker: no listener';
+    let text = clients > 0 ? `扬声器：已连接（${clients}）` : '扬声器：未连接播放端';
     let tone = clients > 0 ? 'ok' : 'warn';
     if (age !== null && age !== undefined && Number.isFinite(Number(age)) && Number(age) < 3) {
-      text += ' playing';
+      text += '，正在播放';
     }
     setBadge($speakerStatus, clients > 0, text, tone);
+  }
+
+  function updatePerformance(data) {
+    const p = data?.pipeline || {};
+    const yolo = data?.yolo || {};
+    const now = performance.now();
+    const count = Number(yolo.inferences || 0);
+    if (count >= lastInferenceCount && now > lastInferenceAt) {
+      const delta = count - lastInferenceCount;
+      if (delta > 0) measuredInferenceFps = delta * 1000 / (now - lastInferenceAt);
+    }
+    lastInferenceCount = count;
+    lastInferenceAt = now;
+    const inferredFps = data?.item_search_running ? measuredInferenceFps : Number(p.processed_fps || 0);
+    if ($captureFps) $captureFps.textContent = `${Number(p.capture_fps || 0).toFixed(1)} 帧/秒`;
+    if ($processFps) $processFps.textContent = `${Number(p.processed_fps || 0).toFixed(1)} 帧/秒`;
+    if ($broadcastFps) $broadcastFps.textContent = `${Number(p.broadcast_fps || 0).toFixed(1)} 帧/秒`;
+    if ($inferenceFps) $inferenceFps.textContent = `${Number(inferredFps || 0).toFixed(1)} 次/秒`;
+    if ($inferenceMs) $inferenceMs.textContent = `${Number(yolo.inference_ms ?? p.inference_ms ?? 0).toFixed(0)} 毫秒`;
+    if ($latencyMs) $latencyMs.textContent = `${Number(p.latency_ms || 0).toFixed(0)} 毫秒`;
+    if ($outputDrops) $outputDrops.textContent = `${Number(p.output_dropped || 0)} / 浏览器 ${localDecodeDrops}`;
+    const esp = p.esp32_camera || {};
+    const rssi = esp.rssi ?? esp.wifi_rssi;
+    const heap = esp.free_heap ?? esp.heap_free;
+    const pieces = [];
+    if (rssi !== undefined) pieces.push(`${rssi} dBm`);
+    if (heap !== undefined) pieces.push(`${Math.round(Number(heap) / 1024)} KB`);
+    if ($deviceMetrics) $deviceMetrics.textContent = pieces.join(' / ') || '本机模拟';
+  }
+
+  function updateDeviceStatus(data) {
+    if (!data) return;
+    if (data.camera_connected) {
+      setBadge($camStatusStage, true, '摄像头：已连接');
+    } else {
+      setBadge($camStatusStage, false, '摄像头：等待接入', 'warn');
+      if (!lastFrameAt || Date.now() - lastFrameAt > 1500) {
+        if ($stageEmpty) $stageEmpty.classList.remove('is-hidden');
+        if ($fps) $fps.textContent = '显示帧率：--';
+        fitCanvas();
+        ctx.fillStyle = '#020509';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      }
+    }
+    if (data.audio_connected && data.asr_streaming) {
+      const chunks = Number(data.asr_audio_chunks || 0);
+      setBadge($audioStatusStage, true, `麦克风：识别中（${chunks} 个音频块）`);
+    } else if (data.audio_connected) {
+      setBadge($audioStatusStage, true, '麦克风：已连接，语音识别未启动');
+    } else {
+      setBadge($audioStatusStage, false, '麦克风：等待接入', 'warn');
+    }
+    if (data.asr_last_error) {
+      setBadge($audioStatusStage, false, asrErrorLabel(data.asr_last_error), 'err');
+    }
+    updateModeAndSpeaker(data);
+    updateYoloBadge(data);
+    updatePerformance(data);
   }
 
   function asrErrorLabel(raw){
     const text = String(raw || '');
     if (!text) return '';
-    if (text.includes('ResponseTimeout')) return 'ASR timeout: reconnecting';
-    if (text.includes('NO_API_KEY') || text.includes('missing DASHSCOPE_API_KEY')) return 'ASR error: API Key missing';
-    if (text.includes('START_FAILED') || text.includes('recognition start failed')) return 'ASR error: start failed';
-    return `ASR error: ${text.slice(0, 42)}`;
+    if (text.includes('ResponseTimeout')) return '语音识别超时，正在重连';
+    if (text.includes('NO_API_KEY') || text.includes('missing DASHSCOPE_API_KEY')) return '语音识别错误：未配置 API Key';
+    if (text.includes('START_FAILED') || text.includes('recognition start failed')) return '语音识别错误：启动失败';
+    if (text.includes('status_code') && text.includes('44')) return '语音识别服务额度或账号状态异常';
+    return `语音识别错误：${text.slice(0, 42)}`;
   }
 
   function navLabelAndText(raw) {
@@ -295,52 +412,111 @@
   window.addEventListener('resize', fitCanvas); fitCanvas();
 
   let wsCam, wsUI, frames = 0, fpsTimer = 0, lastFrameAt = 0;
+  let pendingFrame = null;
+  let frameDecoding = false;
+  let lastStatusPushAt = 0;
 
-  function drawBlob(buf){
+  function markFrameDrawn(){
     lastFrameAt = Date.now();
     if ($stageEmpty) $stageEmpty.classList.add('is-hidden');
-    const blob = new Blob([buf], {type:'image/jpeg'});
-    if ('createImageBitmap' in window){
-      createImageBitmap(blob).then(bmp=>{
-        fitCanvas();
-        ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
-      }).catch(()=>{});
-    }else{
-      const img = new Image();
-      img.onload = ()=>{ fitCanvas(); ctx.drawImage(img,0,0,canvas.width,canvas.height); URL.revokeObjectURL(img.src); };
-      img.src = URL.createObjectURL(blob);
-    }
     frames++;
     const now = performance.now();
     if (!fpsTimer) fpsTimer = now;
     if (now - fpsTimer >= 1000){
-      $fps.textContent = 'FPS: ' + frames;
-      frames = 0; fpsTimer = now;
+      const displayFps = frames * 1000 / (now - fpsTimer);
+      if ($fps) $fps.textContent = `显示帧率：${displayFps.toFixed(1)} 帧/秒`;
+      frames = 0;
+      fpsTimer = now;
     }
+  }
+
+  function decodeImageElement(blob) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      const url = URL.createObjectURL(blob);
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        resolve(img);
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error('画面解码失败'));
+      };
+      img.src = url;
+    });
+  }
+
+  async function pumpLatestFrame(){
+    if (frameDecoding) return;
+    frameDecoding = true;
+    try {
+      while (pendingFrame) {
+        const buf = pendingFrame;
+        pendingFrame = null;
+        const blob = new Blob([buf], {type:'image/jpeg'});
+        let drawable = null;
+        try {
+          drawable = 'createImageBitmap' in window
+            ? await createImageBitmap(blob)
+            : await decodeImageElement(blob);
+          if (pendingFrame) {
+            localDecodeDrops++;
+            if (drawable?.close) drawable.close();
+            continue;
+          }
+          fitCanvas();
+          ctx.drawImage(drawable, 0, 0, canvas.width, canvas.height);
+          markFrameDrawn();
+        } catch (e) {
+          localDecodeDrops++;
+        } finally {
+          if (drawable?.close) drawable.close();
+        }
+      }
+    } finally {
+      frameDecoding = false;
+      if (pendingFrame) void pumpLatestFrame();
+    }
+  }
+
+  function enqueueLatestFrame(buf){
+    if (pendingFrame) localDecodeDrops++;
+    pendingFrame = buf;
+    void pumpLatestFrame();
   }
 
   function connectCamera(){
     try{ if (wsCam) wsCam.close(); }catch(e){}
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     wsCam = new WebSocket(`${proto}://${location.host}/ws/viewer`);
-    setBadge($camStatus, false, 'Viewer: connecting…', 'warn');
+    setBadge($camStatus, false, '画面连接：正在连接', 'warn');
     wsCam.binaryType = 'arraybuffer';
-    wsCam.onopen  = ()=> setBadge($camStatus, true, 'Viewer: online');
-    wsCam.onclose = ()=> setBadge($camStatus, false, 'Viewer: offline');
-    wsCam.onerror = ()=> setBadge($camStatus, false, 'Viewer: error');
-    wsCam.onmessage = (ev)=> drawBlob(ev.data);
+    wsCam.onopen  = ()=> setBadge($camStatus, true, '画面连接：正常');
+    wsCam.onclose = ()=> {
+      pendingFrame = null;
+      setBadge($camStatus, false, '画面连接：已断开', 'warn');
+    };
+    wsCam.onerror = ()=> setBadge($camStatus, false, '画面连接：发生错误', 'err');
+    wsCam.onmessage = (ev)=> enqueueLatestFrame(ev.data);
   }
 
   function connectASR(){
     try{ if (wsUI) wsUI.close(); }catch(e){}
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     wsUI = new WebSocket(`${proto}://${location.host}/ws_ui`);
-    setBadge($asrStatus, false, 'UI: connecting…', 'warn');
-    wsUI.onopen  = ()=> setBadge($asrStatus, true, 'UI: online');
-    wsUI.onclose = ()=> setBadge($asrStatus, false, 'UI: offline');
-    wsUI.onerror = ()=> setBadge($asrStatus, false, 'UI: error');
+    setBadge($asrStatus, false, '状态连接：正在连接', 'warn');
+    wsUI.onopen  = ()=> setBadge($asrStatus, true, '状态连接：正常');
+    wsUI.onclose = ()=> setBadge($asrStatus, false, '状态连接：已断开', 'warn');
+    wsUI.onerror = ()=> setBadge($asrStatus, false, '状态连接：发生错误', 'err');
     wsUI.onmessage = (ev)=>{
       const s = ev.data || '';
+      if (s.startsWith('STATUS:')) {
+        try {
+          lastStatusPushAt = Date.now();
+          updateDeviceStatus(JSON.parse(s.slice(7)));
+        } catch (e) {}
+        return;
+      }
       if (s.startsWith('INIT:')){
         try{
           const data = JSON.parse(s.slice(5));
@@ -428,6 +604,9 @@
           : 'API Key 未配置';
       }
       const models = cfg.models || {};
+      if ($performanceProfileInput) {
+        $performanceProfileInput.value = cfg.performance_profile || 'balanced';
+      }
       if ($blindPathModelInput) $blindPathModelInput.value = models.blind_path_model || '';
       if ($obstacleModelInput) $obstacleModelInput.value = models.obstacle_model || '';
       if ($itemModelInput) $itemModelInput.value = models.item_search_model || '';
@@ -450,6 +629,7 @@
       const itemSearchModel = $itemModelInput?.value?.trim() || '';
       const trafficlightModel = $trafficModelInput?.value?.trim() || '';
       const handTaskPath = $handTaskInput?.value?.trim() || '';
+      const performanceProfile = $performanceProfileInput?.value || 'balanced';
       const res = await fetch('/api/runtime-config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -460,15 +640,17 @@
           item_search_model: itemSearchModel,
           trafficlight_model: trafficlightModel,
           hand_task_path: handTaskPath,
+          performance_profile: performanceProfile,
         })
       });
       if (!res.ok) throw new Error(String(res.status));
       const data = await res.json();
       if ($dashscopeKeyInput) $dashscopeKeyInput.value = '';
       if ($runtimeConfigStatus) {
+        const profileName = data?.performance_profile?.name_zh || '当前';
         $runtimeConfigStatus.textContent = data.api_key_configured
-          ? `API Key 已配置（${data.api_key_masked || '已隐藏'}）`
-          : 'API Key 未配置';
+          ? `配置已保存，${profileName}档；API Key 已配置`
+          : `配置已保存，${profileName}档；API Key 未配置`;
       }
       updateEndpointTexts(normalizeHostPort($serverHostInput?.value));
     } catch (e) {
@@ -493,42 +675,46 @@
     });
   });
 
+  document.querySelectorAll('[data-dev-command]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const command = btn.getAttribute('data-dev-command') || '';
+      const target = btn.getAttribute('data-target') || '';
+      const oldText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '处理中…';
+      try {
+        const res = await fetch('/api/dev/command', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({command, target}),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data?.detail || `请求失败（${res.status}）`);
+        if (data?.status) updateDeviceStatus(data.status);
+        if ($runtimeConfigStatus) $runtimeConfigStatus.textContent = data?.message || '本机测试命令已执行';
+      } catch (e) {
+        if ($runtimeConfigStatus) $runtimeConfigStatus.textContent = `测试命令失败：${e.message || e}`;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = oldText;
+      }
+    });
+  });
+
   async function refreshDeviceStatus(){
+    if (Date.now() - lastStatusPushAt < 2200) return;
     try {
       const res = await fetch('/api/device-status', { cache: 'no-store' });
       if (!res.ok) throw new Error(String(res.status));
       const data = await res.json();
-
-      if (data.camera_connected) {
-        setBadge($camStatusStage, true, 'Camera HW: connected');
-      } else {
-        setBadge($camStatusStage, false, 'Camera HW: waiting', 'warn');
-        if (!lastFrameAt || Date.now() - lastFrameAt > 2500) {
-          if ($stageEmpty) $stageEmpty.classList.remove('is-hidden');
-          $fps.textContent = 'FPS: --';
-        }
-      }
-
-      if (data.audio_connected && data.asr_streaming) {
-        const chunks = Number(data.asr_audio_chunks || 0);
-        setBadge($audioStatusStage, true, `ASR: streaming (${chunks})`);
-      } else if (data.audio_connected) {
-        setBadge($audioStatusStage, true, 'Audio HW: connected / ASR off');
-      } else {
-        setBadge($audioStatusStage, false, 'Audio HW: waiting', 'warn');
-      }
-      if (data.asr_last_error) {
-        setBadge($audioStatusStage, false, asrErrorLabel(data.asr_last_error), 'err');
-      }
-      updateModeAndSpeaker(data);
-      updateYoloBadge(data);
+      updateDeviceStatus(data);
     } catch (e) {
-      setBadge($camStatusStage, false, 'Camera HW: unknown');
-      setBadge($audioStatusStage, false, 'Audio HW: unknown');
-      setBadge($modeStatus, false, 'Mode: unknown', 'warn');
-      setBadge($speakerStatus, false, 'Speaker: unknown', 'warn');
-      setBadge($yoloStatusStage, false, 'YOLO: unknown', 'warn');
-      setBadge($yoloStatus, false, 'YOLO: unknown', 'warn');
+      setBadge($camStatusStage, false, '摄像头：状态未知', 'warn');
+      setBadge($audioStatusStage, false, '麦克风：状态未知', 'warn');
+      setBadge($modeStatus, false, '运行模式：状态未知', 'warn');
+      setBadge($speakerStatus, false, '扬声器：状态未知', 'warn');
+      setBadge($yoloStatusStage, false, '视觉推理：状态未知', 'warn');
+      setBadge($yoloStatus, false, '视觉推理：状态未知', 'warn');
     }
   }
 
@@ -536,7 +722,7 @@
   connectASR();
   loadRuntimeConfig();
   refreshDeviceStatus();
-  setInterval(refreshDeviceStatus, 1200);
+  setInterval(refreshDeviceStatus, 2500);
 })();
 
 
@@ -965,10 +1151,10 @@ import { GLTFLoader } from 'https://unpkg.com/three@0.155.0/examples/jsm/loaders
   }
 
   const ws = new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
-  setImuBadge(false, 'connecting…');
-  ws.onopen  = ()=> setImuBadge(true, 'connected');
-  ws.onclose = ()=> setImuBadge(false, 'disconnected');
-  ws.onerror = ()=> setImuBadge(false, 'error');
+  setImuBadge(false, '正在连接');
+  ws.onopen  = ()=> setImuBadge(true, '已连接');
+  ws.onclose = ()=> setImuBadge(false, '已断开');
+  ws.onerror = ()=> setImuBadge(false, '连接错误');
   ws.onmessage = (ev)=>{
     try{
       const d = JSON.parse(ev.data);
@@ -1063,6 +1249,5 @@ import { GLTFLoader } from 'https://unpkg.com/three@0.155.0/examples/jsm/loaders
   };
 
   // 初次与窗口改变时，保持左右上下对齐
-  window.addEventListener('resize', resize);
-  resize();
+  requestSync();
 })();

@@ -1,6 +1,6 @@
 # app_main.py
 # -*- coding: utf-8 -*-
-import os, sys, time, json, asyncio, base64, audioop, socket
+import os, sys, time, json, asyncio, base64, audioop, socket, ipaddress
 from typing import Any, Dict, Optional, Tuple, List, Callable, Set, Deque
 from collections import deque
 from dataclasses import dataclass
@@ -13,7 +13,7 @@ from .workflow_blindpath import BlindPathNavigator
 # 新增：导入过马路导航器
 from .workflow_crossstreet import CrossStreetNavigator
 import torch
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
@@ -29,7 +29,22 @@ import torch  # 添加这行
 import mediapipe as mp
 from . import bridge_io
 from .paths import APP_DIR, MODEL_DIR as PROJECT_MODEL_DIR, RUNTIME_CONFIG_PATH as PROJECT_RUNTIME_CONFIG_PATH
+from .performance import (
+    DEFAULT_PROFILE,
+    PROFILES,
+    normalize_profile,
+    pipeline_metrics,
+    profile_payload,
+)
 import threading
+
+if sys.platform.startswith("win"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 # ---- .env ----
 try:
     from dotenv import load_dotenv
@@ -43,14 +58,9 @@ DEFAULT_OBSTACLE_MODEL = os.path.join(DEFAULT_MODEL_DIR, "yoloe-11l-seg.pt")
 DEFAULT_TRAFFIC_MODEL = os.path.join(DEFAULT_MODEL_DIR, "trafficlight.pt")
 DEFAULT_HAND_TASK = os.path.join(DEFAULT_MODEL_DIR, "hand_landmarker.task")
 DEFAULT_ITEM_MODEL = os.path.join(DEFAULT_MODEL_DIR, "yoloe-26s-seg.pt")
-DEFAULT_YOLOE_PREWARM_CLASSES = ",".join([
-    "cell phone", "mobile phone", "phone", "mouse", "keyboard", "laptop", "tablet",
-    "computer monitor", "remote control", "charger", "cable", "earphones", "headphones",
-    "watch", "smart watch", "glasses", "wallet", "key", "book", "notebook", "backpack",
-    "handbag", "cup", "bottle", "bowl", "spoon", "fork", "chair", "table", "sofa",
-    "bed", "cabinet", "door", "apple", "banana", "orange", "grape", "pear",
-    "watermelon", "car", "bus", "bicycle", "motorcycle", "truck",
-])
+# 只预热最常用目标，避免启动后长时间占用同一个 YOLOE 模型并阻塞实时找物。
+# 其他目标进入找物时按需预热，UI 会显示“正在准备识别特征”。
+DEFAULT_YOLOE_PREWARM_CLASSES = "cell phone"
 RUNTIME_CONFIG_PATH = str(PROJECT_RUNTIME_CONFIG_PATH)
 MODEL_CONFIG_FIELDS = {
     "blind_path_model": ("BLIND_PATH_MODEL", DEFAULT_NAV_SEG_MODEL),
@@ -59,13 +69,19 @@ MODEL_CONFIG_FIELDS = {
     "hand_task_path": ("HAND_TASK_PATH", DEFAULT_HAND_TASK),
     "item_search_model": ("YOLOE_MODEL_PATH", DEFAULT_ITEM_MODEL),
 }
+PERFORMANCE_PROFILE = DEFAULT_PROFILE
 
 def _load_runtime_config_env():
+    global PERFORMANCE_PROFILE
     try:
         with open(RUNTIME_CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
         return
+    if isinstance(data, dict):
+        PERFORMANCE_PROFILE = normalize_profile(data.get("performance_profile", DEFAULT_PROFILE))
+        os.environ["AIGLASS_PERFORMANCE_PROFILE"] = PERFORMANCE_PROFILE
+        os.environ["AIGLASS_YOLOE_IMGSZ"] = str(PROFILES[PERFORMANCE_PROFILE].yolo_imgsz)
     models = data.get("models", data) if isinstance(data, dict) else {}
     if not isinstance(models, dict):
         return
@@ -99,6 +115,7 @@ SILENCE_20MS = bytes(BYTES_CHUNK)
 from .audio_stream import (
     register_stream_route,         # 挂 /stream.wav
     broadcast_pcm16_realtime,      # 实时向连接分发 16k PCM
+    finish_pcm16_stream,           # 刷新流式音频末尾不足一帧的数据
     hard_reset_audio,              # 音频+AI 播放总闸
     soft_reset_audio,
     BYTES_PER_20MS_16K,
@@ -129,6 +146,7 @@ app = FastAPI()
 app.mount("/static", StaticFiles(directory=os.path.join(APP_DIR, "static")), name="static")
 
 ui_clients: Dict[int, WebSocket] = {}
+ui_client_locks: Dict[int, asyncio.Lock] = {}
 current_partial: str = ""
 recent_finals: List[str] = []
 RECENT_MAX = 50
@@ -138,6 +156,16 @@ camera_viewers: Set[WebSocket] = set()
 esp32_camera_ws: Optional[WebSocket] = None
 imu_ws_clients: Set[WebSocket] = set()
 esp32_audio_ws: Optional[WebSocket] = None
+camera_stats: Dict[str, Any] = {}
+_latest_output_lock = threading.Lock()
+_latest_output_frame: Optional[bytes] = None
+_latest_output_version = 0
+_last_processed_output_at = 0.0
+_output_event: Optional[asyncio.Event] = None
+_viewer_broadcast_task: Optional[asyncio.Task] = None
+_visual_worker_stop = threading.Event()
+_visual_worker_thread: Optional[threading.Thread] = None
+current_item_target_zh = ""
 asr_diag: Dict[str, Any] = {
     "audio_ws_connected": False,
     "streaming": False,
@@ -164,6 +192,230 @@ orchestrator = None  # 新增
 # 【新增】omni对话状态标志
 omni_conversation_active = False  # 标记omni对话是否正在进行
 omni_previous_nav_state = None  # 保存omni激活前的导航状态，用于恢复
+
+
+def _apply_performance_profile(profile_key: str) -> dict:
+    """Apply a profile to server-side inference and connected camera controls."""
+    global PERFORMANCE_PROFILE
+    PERFORMANCE_PROFILE = normalize_profile(profile_key)
+    profile = PROFILES[PERFORMANCE_PROFILE]
+    interval = max(1, int(round(profile.camera_fps / max(1.0, profile.inference_hz))))
+    os.environ["AIGLASS_PERFORMANCE_PROFILE"] = PERFORMANCE_PROFILE
+    os.environ["AIGLASS_YOLOE_IMGSZ"] = str(profile.yolo_imgsz)
+    os.environ["AIGLASS_YOLOE_SEGMENT_INTERVAL"] = str(interval)
+    os.environ["AIGLASS_YOLOE_TRACK_INTERVAL"] = str(interval)
+    try:
+        yolomedia.YOLOE_IMGSZ = profile.yolo_imgsz
+        yolomedia.YOLOE_SEGMENT_INTERVAL = interval
+        yolomedia.YOLOE_TRACK_INTERVAL = interval
+    except Exception:
+        pass
+    try:
+        if blind_path_navigator is not None:
+            blind_path_navigator.BLINDPATH_DETECTION_INTERVAL = interval
+        if cross_street_navigator is not None:
+            cross_street_navigator.CROSSWALK_DETECTION_INTERVAL = interval
+    except Exception:
+        pass
+    return profile_payload(PERFORMANCE_PROFILE)
+
+
+def _current_mode() -> str:
+    if yolomedia_running:
+        return "ITEM_SEARCH"
+    if orchestrator is None:
+        return "IDLE"
+    try:
+        return str(orchestrator.get_state() or "IDLE")
+    except Exception:
+        return "UNKNOWN"
+
+
+def _offer_viewer_frame(jpeg_bytes: bytes, processed: bool = False) -> None:
+    """Store only the newest frame for the single broadcaster coroutine."""
+    global _latest_output_frame, _latest_output_version, _last_processed_output_at
+    if not jpeg_bytes:
+        return
+    now_mono = time.monotonic()
+    if not processed and _last_processed_output_at > 0:
+        # 推理结果刚输出时短暂保留叠加画面，避免原始帧立即覆盖中文状态和框选。
+        hold_sec = max(0.045, min(0.12, 0.65 / max(1.0, PROFILES[PERFORMANCE_PROFILE].inference_hz)))
+        if now_mono - _last_processed_output_at < hold_sec:
+            return
+    with _latest_output_lock:
+        if _output_event is not None and _output_event.is_set():
+            pipeline_metrics.on_output_drop()
+        _latest_output_frame = bytes(jpeg_bytes)
+        _latest_output_version += 1
+        if processed:
+            _last_processed_output_at = now_mono
+    if _output_event is not None:
+        _output_event.set()
+
+
+async def _viewer_broadcast_loop() -> None:
+    """Broadcast the newest JPEG; slow clients never create a frame backlog."""
+    seen_version = 0
+    last_sent_at = 0.0
+    while True:
+        if _output_event is None:
+            await asyncio.sleep(0.05)
+            continue
+        await _output_event.wait()
+        _output_event.clear()
+        min_interval = 1.0 / max(1.0, float(PROFILES[PERFORMANCE_PROFILE].camera_fps))
+        delay = min_interval - (time.monotonic() - last_sent_at)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        with _latest_output_lock:
+            version = _latest_output_version
+            jpeg_bytes = _latest_output_frame
+        if not jpeg_bytes or version == seen_version:
+            continue
+        seen_version = version
+
+        async def _send_one(ws: WebSocket):
+            try:
+                await asyncio.wait_for(ws.send_bytes(jpeg_bytes), timeout=0.35)
+                return None
+            except Exception:
+                return ws
+
+        clients = list(camera_viewers)
+        if clients:
+            dead = await asyncio.gather(*(_send_one(ws) for ws in clients))
+            for ws in dead:
+                if ws is not None:
+                    camera_viewers.discard(ws)
+            pipeline_metrics.on_broadcast()
+            last_sent_at = time.monotonic()
+
+
+async def _send_ui_message(ws: WebSocket, message: str) -> None:
+    lock = ui_client_locks.get(id(ws))
+    if lock is None:
+        await ws.send_text(message)
+        return
+    async with lock:
+        await ws.send_text(message)
+
+
+def _visual_worker() -> None:
+    """Run navigation/traffic inference outside the camera WebSocket loop."""
+    last_seq = 0
+    last_idle_status = None
+    last_traffic_inference_at = 0.0
+    while not _visual_worker_stop.is_set():
+        mode = _current_mode()
+        if yolomedia_running or mode in ("IDLE", "CHAT", "ITEM_SEARCH", "UNKNOWN"):
+            if last_idle_status != mode and not yolomedia_running:
+                bridge_io.set_yolo_status(
+                    running=False,
+                    phase="idle",
+                    target="",
+                    backend="",
+                    device="cuda" if torch.cuda.is_available() else "cpu",
+                )
+                last_idle_status = mode
+            time.sleep(0.05)
+            continue
+        if orchestrator is None:
+            time.sleep(0.05)
+            continue
+        packet = bridge_io.wait_next_raw_bgr(last_seq, timeout_sec=0.5)
+        if packet is None:
+            continue
+        last_seq = packet.seq
+        if mode == "TRAFFIC_LIGHT_DETECTION":
+            interval = 1.0 / max(1.0, PROFILES[PERFORMANCE_PROFILE].inference_hz)
+            now_mono = time.monotonic()
+            if now_mono - last_traffic_inference_at < interval:
+                continue
+            last_traffic_inference_at = now_mono
+
+        target_zh = "红绿灯" if mode == "TRAFFIC_LIGHT_DETECTION" else (
+            "斑马线" if mode in ("CROSSING", "SEEKING_CROSSWALK", "WAIT_TRAFFIC_LIGHT", "SEEKING_NEXT_BLINDPATH") else "盲道"
+        )
+        bridge_io.set_yolo_status(
+            running=True,
+            phase="infer",
+            target=target_zh,
+            backend="YOLO",
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            source_seq=packet.seq,
+            frame_age_ms=max(0.0, (time.time() - packet.captured_at) * 1000.0),
+            last_error="",
+        )
+        started = time.perf_counter()
+        guidance_text = ""
+        try:
+            if mode == "TRAFFIC_LIGHT_DETECTION":
+                from . import trafficlight_detection
+                result = trafficlight_detection.process_single_frame(packet.bgr)
+                out_img = result.get("vis_image") if isinstance(result, dict) else packet.bgr
+            else:
+                result = orchestrator.process_frame(packet.bgr)
+                out_img = result.annotated_image if result.annotated_image is not None else packet.bgr
+                guidance_text = str(result.guidance_text or "")
+        except Exception as exc:
+            bridge_io.set_yolo_status(running=False, phase="failed", target=target_zh, last_error=str(exc))
+            continue
+
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        pipeline_metrics.on_processed(
+            captured_at=packet.captured_at,
+            inference_ms=elapsed_ms,
+        )
+        bridge_io.set_yolo_status(
+            running=True,
+            phase="result",
+            target=target_zh,
+            backend="YOLO",
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            inference_ms=elapsed_ms,
+            source_seq=packet.seq,
+            frame_age_ms=max(0.0, (time.time() - packet.captured_at) * 1000.0),
+            last_error="",
+        )
+        bridge_io.send_vis_bgr(out_img if out_img is not None else packet.bgr, quality=78)
+        if guidance_text:
+            try:
+                play_voice_text(guidance_text)
+                bridge_io.send_ui_final(f"[导航] {guidance_text}")
+            except Exception:
+                pass
+
+
+def _persist_runtime_config(models: Optional[dict] = None) -> None:
+    try:
+        with open(RUNTIME_CONFIG_PATH, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+    except Exception:
+        existing = {}
+    if not isinstance(existing, dict):
+        existing = {}
+    if models is not None:
+        existing["models"] = dict(models)
+    existing["performance_profile"] = PERFORMANCE_PROFILE
+    try:
+        with open(RUNTIME_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"[CONFIG] failed to persist runtime config: {exc}", flush=True)
+
+
+async def _send_camera_profile(ws: WebSocket) -> None:
+    profile = PROFILES[PERFORMANCE_PROFILE]
+    for command in (
+        f"SET:FRAMESIZE={profile.framesize}",
+        f"SET:QUALITY={profile.jpeg_quality}",
+        f"SET:FPS={profile.camera_fps}",
+    ):
+        try:
+            await ws.send_text(command)
+        except Exception:
+            break
+
 
 # 【新增】模型加载函数
 def load_navigation_models():
@@ -295,11 +547,12 @@ async def ui_broadcast_raw(msg: str):
     dead = []
     for k, ws in list(ui_clients.items()):
         try:
-            await ws.send_text(msg)
+            await _send_ui_message(ws, msg)
         except Exception:
             dead.append(k)
     for k in dead:
         ui_clients.pop(k, None)
+        ui_client_locks.pop(k, None)
 
 
 async def ui_broadcast_partial(text: str):
@@ -355,9 +608,9 @@ async def full_system_reset(reason: str = ""):
     print("[SYSTEM] full reset done.", flush=True)
 
 # ========= 启动/停止 YOLO 媒体处理 =========
-def start_yolomedia_with_target(target_name: str):
+def start_yolomedia_with_target(target_name: str, display_name: Optional[str] = None):
     """启动yolomedia线程，搜索指定物品"""
-    global yolomedia_thread, yolomedia_stop_event, yolomedia_running, yolomedia_sending_frames
+    global yolomedia_thread, yolomedia_stop_event, yolomedia_running, yolomedia_sending_frames, current_item_target_zh
     
     # 如果已经在运行，先停止
     if yolomedia_running:
@@ -365,6 +618,7 @@ def start_yolomedia_with_target(target_name: str):
     
     # 查找对应的YOLO类别
     yolo_class = ITEM_TO_CLASS_MAP.get(target_name, target_name)
+    current_item_target_zh = str(display_name or target_name or "").strip()
     try:
         from .yoloe_backend import is_yoloe_text_cached
         text_ready = is_yoloe_text_cached([yolo_class])
@@ -375,12 +629,14 @@ def start_yolomedia_with_target(target_name: str):
     bridge_io.set_yolo_status(
         running=True,
         phase="starting" if text_ready else "lazy_prewarm",
-        target=yolo_class,
+        target=current_item_target_zh,
+        model_target=yolo_class,
         backend="YOLOE",
         frames=0,
         inferences=0,
         detections=0,
         last_error="",
+        technical_error="",
         started_at=time.time(),
     )
     
@@ -398,6 +654,7 @@ def start_yolomedia_with_target(target_name: str):
                     target=yolo_class,
                     backend="YOLOE",
                     last_error="",
+                    technical_error="",
                 )
                 try:
                     from .yoloe_backend import prewarm_yoloe
@@ -418,8 +675,23 @@ def start_yolomedia_with_target(target_name: str):
                     return
             yolomedia.main(headless=True, prompt_name=yolo_class, stop_event=yolomedia_stop_event)
         except Exception as e:
-            print(f"[YOLOMEDIA] worker stopped: {e}", flush=True)
-            bridge_io.set_yolo_status(running=False, phase="failed", last_error=str(e))
+            technical_error = str(e)
+            if "same dtype" in technical_error or "Half != float" in technical_error:
+                user_error = "视觉模型精度不兼容，已自动恢复；请重新开始寻找。"
+            elif "Inference tensors do not track version counter" in technical_error:
+                user_error = "视觉特征缓存异常，已自动清理；请重新开始寻找。"
+            else:
+                user_error = "视觉模型运行异常，找物已停止并恢复原模式。"
+            print(f"[YOLOMEDIA] worker stopped: {technical_error}", flush=True)
+            bridge_io.set_yolo_status(
+                running=False,
+                phase="failed",
+                target=current_item_target_zh,
+                model_target=yolo_class,
+                last_error=user_error,
+                technical_error=technical_error,
+            )
+            bridge_io.send_ui_final(f"[找物品] {user_error}")
         finally:
             global yolomedia_running, yolomedia_sending_frames
             yolomedia_running = False
@@ -433,7 +705,14 @@ def start_yolomedia_with_target(target_name: str):
                     except Exception as exc:
                         print(f"[ITEM_SEARCH] completed state restore failed: {exc}", flush=True)
                 bridge_io.set_yolo_status(running=False, phase="completed")
-            elif status.get("phase") != "failed":
+            elif status.get("phase") == "failed":
+                if orchestrator:
+                    try:
+                        orchestrator.stop_item_search(restore_nav=True)
+                        print(f"[ITEM_SEARCH] failed, restored state={orchestrator.get_state()}", flush=True)
+                    except Exception as exc:
+                        print(f"[ITEM_SEARCH] failed state restore error: {exc}", flush=True)
+            else:
                 bridge_io.set_yolo_status(running=False, phase="stopped")
     
     yolomedia_thread = threading.Thread(target=_run, daemon=True)
@@ -454,7 +733,7 @@ def stop_yolomedia():
         
         yolomedia_running = False
         yolomedia_sending_frames = False
-        bridge_io.set_yolo_status(running=False, phase="stopping")
+        bridge_io.set_yolo_status(running=False, phase="stopping", technical_error="")
         
         # 【新增】如果orchestrator在找物品模式，结束时不自动恢复（由命令控制）
         # 只清理标志位即可
@@ -619,7 +898,7 @@ async def start_ai_with_text_custom(user_text: str):
                 print(f"[ITEM_SEARCH] 已切换到找物品模式，状态: {orchestrator.get_state()}")
             
             # 【关键】把英文类名传给 yolomedia（它会在找不到类时自动切 YOLOE）
-            start_yolomedia_with_target(label_en)
+            start_yolomedia_with_target(label_en, display_name=item_cn)
 
             # 给前端/语音来个确认反馈
             try:
@@ -707,6 +986,7 @@ async def start_ai_with_text(user_text: str):
             except Exception:
                 pass
         finally:
+            await finish_pcm16_stream()
             # 【修改】标记omni对话结束，恢复之前的导航模式
             global omni_conversation_active, omni_previous_nav_state
             omni_conversation_active = False
@@ -719,13 +999,6 @@ async def start_ai_with_text(user_text: str):
             else:
                 print(f"[OMNI] 对话结束（无需恢复导航状态）")
             
-            # 自然结束时，给当前连接一个 "完结" 信号
-            from .audio_stream import stream_clients  # 局部导入，避免环依赖
-            for sc in list(stream_clients):
-                if not sc.abort_event.is_set():
-                    try: sc.q.put_nowait(b"\x00"*BYTES_PER_20MS_16K)  # 一帧静音
-                    except Exception: pass
-
             final_text = ("".join(txt_buf)).strip() or "（空响应）"
             try:
                 await ui_broadcast_final("[AI] " + final_text)
@@ -751,8 +1024,7 @@ def root():
 def health():
     return "OK"
 
-@app.get("/api/device-status")
-def device_status():
+def _device_status_payload() -> dict:
     def _ws_connected(ws: Optional[WebSocket]) -> bool:
         try:
             return bool(ws and ws.client_state == WebSocketState.CONNECTED)
@@ -765,13 +1037,9 @@ def device_status():
             last_frame_age = max(0.0, time.time() - last_frames[-1][0])
         except Exception:
             last_frame_age = None
-    mode = "CHAT"
-    if orchestrator:
-        try:
-            mode = orchestrator.get_state()
-        except Exception:
-            mode = "UNKNOWN"
-
+    yolo_status = bridge_io.get_yolo_status()
+    if current_item_target_zh:
+        yolo_status["target_zh"] = current_item_target_zh
     return {
         "camera_connected": _ws_connected(esp32_camera_ws),
         "audio_connected": _ws_connected(esp32_audio_ws),
@@ -781,11 +1049,21 @@ def device_status():
         "asr_streaming": bool(asr_diag.get("streaming")),
         "asr_audio_chunks": int(asr_diag.get("audio_chunks") or 0),
         "asr_last_error": asr_diag.get("last_error") or "",
-        "mode": mode,
+        "mode": _current_mode(),
         "item_search_running": bool(yolomedia_running),
+        "item_search_target": current_item_target_zh,
         "audio_stream": get_stream_status(),
-        "yolo": bridge_io.get_yolo_status(),
+        "yolo": yolo_status,
+        "pipeline": pipeline_metrics.snapshot(),
+        "frame_buffer": bridge_io.get_frame_stats(),
+        "performance_profile": profile_payload(PERFORMANCE_PROFILE),
     }
+
+
+@app.get("/api/device-status")
+def device_status():
+    return _device_status_payload()
+
 
 @app.get("/api/asr-status")
 def asr_status():
@@ -913,6 +1191,11 @@ def runtime_config(request: Request):
             "audio_ws": "ESP32 麦克风 PCM16 上传",
             "imu_udp": "ESP32 IMU UDP JSON 发送目标",
         },
+        "performance_profile": PERFORMANCE_PROFILE,
+        "performance_profiles": {
+            key: profile_payload(key)
+            for key in PROFILES
+        },
         "models": {
             "blind_path_model": os.getenv("BLIND_PATH_MODEL", DEFAULT_NAV_SEG_MODEL),
             "obstacle_model": os.getenv("OBSTACLE_MODEL", DEFAULT_OBSTACLE_MODEL),
@@ -940,42 +1223,137 @@ async def update_runtime_config(request: Request):
                 _omni_client.set_api_key(new_key)
         except Exception:
             pass
+    requested_profile = str(body.get("performance_profile") or PERFORMANCE_PROFILE)
+    profile = _apply_performance_profile(requested_profile)
     model_updates = {
-        "BLIND_PATH_MODEL": str(body.get("blind_path_model") or "").strip(),
-        "OBSTACLE_MODEL": str(body.get("obstacle_model") or "").strip(),
-        "TRAFFICLIGHT_MODEL": str(body.get("trafficlight_model") or "").strip(),
-        "HAND_TASK_PATH": str(body.get("hand_task_path") or "").strip(),
-        "YOLOE_MODEL_PATH": str(body.get("item_search_model") or "").strip(),
+        field: (env_key, str(body.get(field) or "").strip())
+        for field, (env_key, _default) in MODEL_CONFIG_FIELDS.items()
     }
+    persisted_models = {}
+    try:
+        with open(RUNTIME_CONFIG_PATH, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+    except Exception:
+        existing = {}
+    if isinstance(existing, dict) and isinstance(existing.get("models"), dict):
+        persisted_models.update(existing["models"])
+
     saved_models = {}
-    for env_key, value in model_updates.items():
+    for field, (env_key, value) in model_updates.items():
         if value:
             os.environ[env_key] = value
-            saved_models[env_key.lower()] = value
-    if saved_models:
-        persisted_models = {}
+            persisted_models[field] = value
+            saved_models[field] = value
+
+    for field, (env_key, default) in MODEL_CONFIG_FIELDS.items():
+        persisted_models.setdefault(field, os.getenv(env_key, default))
+    _persist_runtime_config(persisted_models)
+    if esp32_camera_ws is not None:
         try:
-            with open(RUNTIME_CONFIG_PATH, "r", encoding="utf-8") as f:
-                existing = json.load(f)
+            await _send_camera_profile(esp32_camera_ws)
         except Exception:
-            existing = {}
-        if isinstance(existing, dict) and isinstance(existing.get("models"), dict):
-            persisted_models.update(existing["models"])
-        for field, (env_key, _default) in MODEL_CONFIG_FIELDS.items():
-            value = os.environ.get(env_key, "")
-            if value:
-                persisted_models[field] = value
-        try:
-            with open(RUNTIME_CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump({"models": persisted_models}, f, ensure_ascii=False, indent=2)
-        except Exception as exc:
-            print(f"[CONFIG] failed to persist runtime config: {exc}", flush=True)
+            pass
     return {
         "ok": True,
         "api_key_configured": bool(API_KEY),
         "api_key_masked": _mask_key(API_KEY),
         "saved_models": saved_models,
+        "performance_profile": profile,
     }
+
+
+def _dev_control_allowed(request: Request) -> bool:
+    if os.getenv("AIGLASS_ALLOW_DEV_CONTROL", "0").strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    host = str(request.client.host if request.client else "").split("%", 1)[0]
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+@app.post("/api/dev/command")
+async def dev_command(request: Request):
+    """本机硬件测试入口；不会启动 ASR，也不会产生语音识别调用费用。"""
+    global current_item_target_zh
+    if not _dev_control_allowed(request):
+        raise HTTPException(
+            status_code=403,
+            detail="开发控制接口仅允许本机访问；远程调试请设置 AIGLASS_ALLOW_DEV_CONTROL=1。",
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    command = str(body.get("command") or "").strip().lower()
+    target = str(body.get("target") or "手机").strip() or "手机"
+
+    if command in ("find", "item_search"):
+        label_en, source = extract_english_label(target)
+        if orchestrator is not None:
+            orchestrator.start_item_search()
+        start_yolomedia_with_target(label_en, display_name=target)
+        await ui_broadcast_final(f"[找物品] 正在寻找“{target}”")
+        message = f"已开始寻找“{target}”"
+        extra = {"target": target, "model_target": label_en, "label_source": source}
+    elif command in ("stop_find", "stop_item_search"):
+        stop_yolomedia()
+        if orchestrator is not None:
+            orchestrator.stop_item_search(restore_nav=False)
+        bridge_io.set_yolo_status(running=False, phase="stopped", target=current_item_target_zh)
+        await ui_broadcast_final(f"[找物品] 已停止寻找“{current_item_target_zh or target}”")
+        message = "已停止找物"
+        extra = {}
+        current_item_target_zh = ""
+    elif command in ("blindpath", "blind_path"):
+        stop_yolomedia()
+        current_item_target_zh = ""
+        if orchestrator is None:
+            raise HTTPException(status_code=409, detail="导航器尚未就绪，请先连接摄像头。")
+        orchestrator.start_blind_path_navigation()
+        await ui_broadcast_final("[系统] 盲道导航已启动")
+        message = "已启动盲道导航"
+        extra = {}
+    elif command in ("traffic", "traffic_light"):
+        stop_yolomedia()
+        current_item_target_zh = ""
+        if orchestrator is None:
+            raise HTTPException(status_code=409, detail="导航器尚未就绪，请先连接摄像头。")
+        from . import trafficlight_detection
+        if not trafficlight_detection.init_model():
+            raise HTTPException(status_code=503, detail="红绿灯模型加载失败。")
+        trafficlight_detection.reset_detection_state()
+        orchestrator.start_traffic_light_detection()
+        await ui_broadcast_final("[系统] 红绿灯检测已启动")
+        message = "已启动红绿灯检测"
+        extra = {}
+    elif command in ("crossing", "cross"):
+        stop_yolomedia()
+        current_item_target_zh = ""
+        if orchestrator is None:
+            raise HTTPException(status_code=409, detail="导航器尚未就绪，请先连接摄像头。")
+        orchestrator.start_crossing()
+        await ui_broadcast_final("[系统] 过马路模式已启动")
+        message = "已启动过马路模式"
+        extra = {}
+    elif command in ("chat", "idle"):
+        stop_yolomedia()
+        current_item_target_zh = ""
+        if orchestrator is not None:
+            orchestrator.stop_navigation()
+        bridge_io.set_yolo_status(running=False, phase="idle", target="", last_error="")
+        await ui_broadcast_final("[系统] 已返回聊天模式")
+        message = "已返回聊天模式"
+        extra = {}
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="未知命令，可用命令：find、stop_find、blindpath、traffic、crossing、chat。",
+        )
+    return {"ok": True, "message": message, "status": _device_status_payload(), **extra}
+
 
 # 注册 /stream.wav
 register_stream_route(app)
@@ -985,15 +1363,23 @@ register_stream_route(app)
 async def ws_ui(ws: WebSocket):
     await ws.accept()
     ui_clients[id(ws)] = ws
+    ui_client_locks[id(ws)] = asyncio.Lock()
     try:
         init = {"partial": current_partial, "finals": recent_finals[-10:]}
-        await ws.send_text("INIT:" + json.dumps(init, ensure_ascii=False))
+        await _send_ui_message(ws, "INIT:" + json.dumps(init, ensure_ascii=False))
         while True:
-            await asyncio.sleep(60)
+            await _send_ui_message(
+                ws,
+                "STATUS:" + json.dumps(_device_status_payload(), ensure_ascii=False),
+            )
+            await asyncio.sleep(0.75)
     except WebSocketDisconnect:
+        pass
+    except Exception:
         pass
     finally:
         ui_clients.pop(id(ws), None)
+        ui_client_locks.pop(id(ws), None)
 
 # ---------- WebSocket：ESP32 音频入口（ASR 上行） ----------
 @app.websocket("/ws_audio")
@@ -1160,7 +1546,7 @@ async def ws_audio(ws: WebSocket):
 # ---------- WebSocket：ESP32 相机入口（JPEG 二进制） ----------
 @app.websocket("/ws/camera")
 async def ws_camera_esp(ws: WebSocket):
-    global esp32_camera_ws, blind_path_navigator, cross_street_navigator, cross_street_active, navigation_active, orchestrator
+    global esp32_camera_ws, blind_path_navigator, cross_street_navigator, cross_street_active, navigation_active, orchestrator, camera_stats
     if esp32_camera_ws is not None:
         await ws.close(code=1013)
         return
@@ -1202,135 +1588,50 @@ async def ws_camera_esp(ws: WebSocket):
     if orchestrator is None and blind_path_navigator is not None and cross_street_navigator is not None:
         orchestrator = NavigationMaster(blind_path_navigator, cross_street_navigator)
         print("[NAV MASTER] 统领状态机已初始化（托管模式）")
-    frame_counter = 0  # 添加帧计数器
-    
+    _apply_performance_profile(PERFORMANCE_PROFILE)
+    await _send_camera_profile(ws)
+    frame_counter = 0
+    last_stat_log = time.time()
+
     try:
         while True:
             msg = await ws.receive()
             if "bytes" in msg and msg["bytes"] is not None:
                 data = msg["bytes"]
                 frame_counter += 1
-                
-                # 【新增】录制原始帧
-                try:
-                    sync_recorder.record_frame(data)
-                except Exception as e:
-                    if frame_counter % 100 == 0:  # 避免日志刷屏
-                        print(f"[RECORDER] 录制帧失败: {e}")
-                
-                try:
-                    last_frames.append((time.time(), data))
-                except Exception:
-                    pass
-                
-                # 推送到bridge_io（供yolomedia使用）
-                bridge_io.push_raw_jpeg(data)
-                
-                # 【调试】检查导航条件
-                if frame_counter % 30 == 0:  # 每30帧输出一次
-                    state_dbg = orchestrator.get_state() if orchestrator else "N/A"
-                    print(f"[NAVIGATION DEBUG] 帧:{frame_counter}, state={state_dbg}, yolomedia_running={yolomedia_running}")
-                
-                # 统一解码（添加更严格的异常处理）
-                try:
-                    arr = np.frombuffer(data, dtype=np.uint8)
-                    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                    # 验证解码结果
-                    if bgr is None or bgr.size == 0:
-                        if frame_counter % 30 == 0:
-                            print(f"[JPEG] 解码失败：数据长度={len(data)}")
-                        bgr = None
-                except Exception as e:
-                    if frame_counter % 30 == 0:
-                        print(f"[JPEG] 解码异常: {e}")
-                    bgr = None
-
-                # 【托管】优先交给统领状态机（寻物未占用画面时）
-                # 【修改】找物品模式时不执行导航处理，让yolomedia接管画面
-                if orchestrator and not yolomedia_running and bgr is not None:
-                    current_state = orchestrator.get_state()
-                    
-                    # 【新增】找物品模式：不处理画面，等待yolomedia发送处理后的帧
-                    if current_state == "ITEM_SEARCH":
-                        # 找物品模式下，如果yolomedia还没开始发送帧，先显示原始画面
-                        if not yolomedia_sending_frames and camera_viewers:
-                            ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                            if ok:
-                                jpeg_data = enc.tobytes()
-                                dead = []
-                                for viewer_ws in list(camera_viewers):
-                                    try:
-                                        await viewer_ws.send_bytes(jpeg_data)
-                                    except Exception:
-                                        dead.append(viewer_ws)
-                                for d in dead:
-                                    camera_viewers.discard(d)
-                        continue  # 跳过后续的导航处理
-                    
-                    out_img = bgr
+                now = time.time()
+                pipeline_metrics.on_capture(len(data), now)
+                if ENABLE_SYNC_RECORDING:
                     try:
-                        # 【新增】检查是否在红绿灯检测模式
-                        if current_state == "TRAFFIC_LIGHT_DETECTION":
-                            # 红绿灯检测模式：在主线程中直接处理，避免掉帧
-                            from . import trafficlight_detection
-                            result = trafficlight_detection.process_single_frame(bgr, ui_broadcast_callback=ui_broadcast_final)
-                            out_img = result['vis_image'] if result['vis_image'] is not None else bgr
-                        else:
-                            # 其他模式：正常的导航处理
-                            res = orchestrator.process_frame(bgr)
-
-                            # 语音引导（内部已节流）
-                            # 注：omni对话时已切换到CHAT模式，不会生成导航语音
-                            if res.guidance_text:
-                                try:
-                                    # 先播放语音，再广播到UI
-                                    play_voice_text(res.guidance_text)
-                                    await ui_broadcast_final(f"[导航] {res.guidance_text}")
-                                except Exception:
-                                    pass
-
-                            # 输出图像
-                            out_img = res.annotated_image if res.annotated_image is not None else bgr
+                        sync_recorder.record_frame(data)
                     except Exception as e:
                         if frame_counter % 100 == 0:
-                            print(f"[NAV MASTER] 处理帧时出错: {e}")
-
-                    # 广播图像
-                    if camera_viewers and out_img is not None:
-                        ok, enc = cv2.imencode(".jpg", out_img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                        if ok:
-                            jpeg_data = enc.tobytes()
-                            dead = []
-                            for viewer_ws in list(camera_viewers):
-                                try:
-                                    await viewer_ws.send_bytes(jpeg_data)
-                                except Exception:
-                                    dead.append(viewer_ws)
-                            for d in dead:
-                                camera_viewers.discard(d)
-                    # 已托管，进入下一帧
-                    continue
-
-                # 【回退】寻物占用或者未解码成功，按原始画面回传
+                            print(f"[RECORDER] 录制帧失败: {e}")
+                last_frames.append((now, data))
+                bridge_io.push_raw_jpeg(data)
+                # 原始 JPEG 始终作为低延迟底图；推理完成后再用处理帧覆盖。
+                # 找物进入跟踪后由 yolomedia 连续输出，此时停止原始帧覆盖。
                 if not yolomedia_sending_frames and camera_viewers:
+                    _offer_viewer_frame(data)
+                if now - last_stat_log >= 5.0:
+                    snap = pipeline_metrics.snapshot()
+                    print(
+                        f"[CAMERA] 接收={snap['capture_fps']:.1f} FPS "
+                        f"处理={snap['processed_fps']:.1f} FPS "
+                        f"显示={snap['broadcast_fps']:.1f} FPS "
+                        f"延迟={snap['latency_ms']:.0f}ms",
+                        flush=True,
+                    )
+                    last_stat_log = now
+
+            elif "text" in msg and msg["text"] is not None:
+                text = str(msg["text"]).strip()
+                if text.startswith("STAT:"):
                     try:
-                        if bgr is None:
-                            arr = np.frombuffer(data, dtype=np.uint8)
-                            bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                        if bgr is not None:
-                            ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                            if ok:
-                                jpeg_data = enc.tobytes()
-                                dead = []
-                                for viewer_ws in list(camera_viewers):
-                                    try:
-                                        await viewer_ws.send_bytes(jpeg_data)
-                                    except Exception:
-                                        dead.append(viewer_ws)
-                                for ws in dead:
-                                    camera_viewers.discard(ws)
-                    except Exception as e:
-                        print(f"[CAMERA] Broadcast error: {e}")
+                        camera_stats = json.loads(text[5:])
+                        pipeline_metrics.update_esp32_camera(camera_stats)
+                    except Exception:
+                        pass
 
             elif "type" in msg and msg["type"] in ("websocket.close", "websocket.disconnect"):
                 break
@@ -1345,16 +1646,13 @@ async def ws_camera_esp(ws: WebSocket):
         except Exception:
             pass
         esp32_camera_ws = None
+        bridge_io.clear_raw_frames()
+        bridge_io.set_yolo_status(
+            running=bool(yolomedia_running),
+            phase="camera_waiting" if yolomedia_running else "idle",
+            last_error="",
+        )
         print("[CAMERA] ESP32 disconnected")
-        
-        # 【新增】清理导航状态
-        if blind_path_navigator:
-            blind_path_navigator.reset()
-        if cross_street_navigator:
-            cross_street_navigator.reset()
-        if orchestrator:
-            orchestrator.reset()
-            print("[NAV MASTER] 统领器已重置")
 
 # ---------- WebSocket：浏览器订阅相机帧 ----------
 @app.websocket("/ws/viewer")
@@ -1364,8 +1662,12 @@ async def ws_viewer(ws: WebSocket):
     print(f"[VIEWER] Browser connected. Total viewers: {len(camera_viewers)}", flush=True)
     try:
         while True:
-            # 保持连接活跃
-            await asyncio.sleep(60)
+            try:
+                message = await asyncio.wait_for(ws.receive(), timeout=15.0)
+                if message.get("type") in ("websocket.close", "websocket.disconnect"):
+                    break
+            except asyncio.TimeoutError:
+                continue
     except WebSocketDisconnect:
         print("[VIEWER] Browser disconnected", flush=True)
     finally:
@@ -1529,49 +1831,55 @@ class UDPProto(asyncio.DatagramProtocol):
 
 
 
-# === 新增：注册给 bridge_io 的发送回调（把 JPEG 广播给 /ws/viewer） ===
+# === 注册 bridge_io 回调并启动低延迟视觉管线 ===
 @app.on_event("startup")
 async def on_startup_register_bridge_sender():
-    # 保存主线程的事件循环
-    main_loop = asyncio.get_event_loop()
-    
+    global _output_event, _viewer_broadcast_task, _visual_worker_thread
+    main_loop = asyncio.get_running_loop()
+    _output_event = asyncio.Event()
+    _viewer_broadcast_task = asyncio.create_task(
+        _viewer_broadcast_loop(),
+        name="viewer-latest-frame-broadcaster",
+    )
+    _visual_worker_stop.clear()
+    if _visual_worker_thread is None or not _visual_worker_thread.is_alive():
+        _visual_worker_thread = threading.Thread(
+            target=_visual_worker,
+            name="visual-worker",
+            daemon=True,
+        )
+        _visual_worker_thread.start()
+
     def _sender(jpeg_bytes: bytes):
-        # 注意：这个函数可能在非协程线程里被调用，需要切回主事件循环
-        try:
-            # 检查事件循环状态，避免在关闭时发送
-            if main_loop.is_closed():
-                return
-            
-            # 标记YOLO已经开始发送处理后的帧
+        if main_loop.is_closed():
+            return
+
+        def _offer():
             global yolomedia_sending_frames
-            if not yolomedia_sending_frames:
+            if yolomedia_running and not yolomedia_sending_frames:
                 yolomedia_sending_frames = True
-                print("[YOLOMEDIA] 开始发送处理后的帧，切换到YOLO画面", flush=True)
-            
-            async def _broadcast():
-                if not camera_viewers:
-                    return
-                dead = []
-                for ws in list(camera_viewers):
-                    try:
-                        await ws.send_bytes(jpeg_bytes)
-                    except Exception as e:
-                        dead.append(ws)
-                for ws in dead:
-                    try:
-                        camera_viewers.remove(ws)
-                    except Exception:
-                        pass
-            
-            # 使用保存的主线程事件循环
-            future = asyncio.run_coroutine_threadsafe(_broadcast(), main_loop)
-            # 不等待结果，避免阻塞生产线程
-        except Exception as e:
-            # 只在非预期错误时打印日志
-            if "Event loop is closed" not in str(e):
-                print(f"[DEBUG] _sender error: {e}", flush=True)
+                print("[YOLOMEDIA] 已切换到处理后画面", flush=True)
+            _offer_viewer_frame(jpeg_bytes, processed=True)
+
+        try:
+            main_loop.call_soon_threadsafe(_offer)
+        except RuntimeError:
+            pass
+
+    def _ui_sender(text: str):
+        if main_loop.is_closed():
+            return
+
+        def _schedule():
+            asyncio.create_task(ui_broadcast_final(text))
+
+        try:
+            main_loop.call_soon_threadsafe(_schedule)
+        except RuntimeError:
+            pass
 
     bridge_io.set_sender(_sender)
+    bridge_io.set_ui_sender(_ui_sender)
 
 @app.on_event("startup")
 async def on_startup_init_audio():
@@ -1592,7 +1900,8 @@ async def on_startup_prewarm_yoloe():
             from .yoloe_backend import prewarm_yoloe
             raw = os.getenv("AIGLASS_YOLOE_PREWARM_CLASSES", DEFAULT_YOLOE_PREWARM_CLASSES)
             names = [x.strip() for x in raw.split(",") if x.strip()]
-            names.extend(ITEM_TO_CLASS_MAP.values())
+            if os.getenv("AIGLASS_YOLOE_PREWARM_CUSTOM", "0").strip().lower() in ("1", "true", "yes", "on"):
+                names.extend(ITEM_TO_CLASS_MAP.values())
             prewarm_yoloe(names)
         except Exception as e:
             print(f"[YOLOE] prewarm failed: {e}", flush=True)
@@ -1608,10 +1917,26 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     """应用关闭时的清理工作"""
+    global _viewer_broadcast_task, _visual_worker_thread, _output_event
     print("[SHUTDOWN] 开始清理资源...")
     
     # 停止YOLO媒体处理
     stop_yolomedia()
+    _visual_worker_stop.set()
+    bridge_io.clear_raw_frames()
+    if _visual_worker_thread is not None and _visual_worker_thread.is_alive():
+        await asyncio.to_thread(_visual_worker_thread.join, 2.0)
+    _visual_worker_thread = None
+    bridge_io.set_sender(None)
+    bridge_io.set_ui_sender(None)
+    if _viewer_broadcast_task is not None:
+        _viewer_broadcast_task.cancel()
+        try:
+            await _viewer_broadcast_task
+        except asyncio.CancelledError:
+            pass
+        _viewer_broadcast_task = None
+    _output_event = None
     
     # 停止音频和AI任务
     await hard_reset_audio("shutdown")

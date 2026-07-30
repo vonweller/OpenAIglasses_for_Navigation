@@ -23,7 +23,33 @@ TRACKER_CFG = os.getenv("YOLO_TRACKER_YAML", "bytetrack.yaml")
 
 _CACHE_LOCK = threading.RLock()
 _MODEL_CACHE: Dict[Tuple[str, str], Any] = {}
-_TEXT_PE_CACHE: Dict[Tuple[str, Tuple[str, ...]], Any] = {}
+_TEXT_PE_CACHE: Dict[Tuple[str, str, str, Tuple[str, ...]], Any] = {}
+
+
+def _fp16_enabled(device: str) -> bool:
+    return str(device).startswith("cuda") and os.getenv("AIGLASS_FP16", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _regular_tensor(
+    value: torch.Tensor,
+    *,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Copy an inference tensor into a normal tensor that is safe to cache."""
+    with torch.inference_mode(False):
+        result = value.detach().clone()
+        if device is not None or dtype is not None:
+            result = result.to(
+                device=device if device is not None else result.device,
+                dtype=dtype if dtype is not None else result.dtype,
+            )
+    return result
 
 
 def _clean_names(names: List[str]) -> List[str]:
@@ -37,13 +63,22 @@ def _clean_names(names: List[str]) -> List[str]:
     return clean_names
 
 
-def is_yoloe_text_cached(names: List[str], model_path: Optional[str] = None) -> bool:
+def is_yoloe_text_cached(
+    names: List[str],
+    model_path: Optional[str] = None,
+    device: Optional[Union[str, int]] = None,
+) -> bool:
     clean_names = _clean_names(names)
     if not clean_names:
         return True
     abs_model_path = os.path.abspath(model_path or DEFAULT_MODEL_PATH)
+    resolved_device = str(device) if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
+    precision = "fp16" if _fp16_enabled(resolved_device) else "fp32"
     with _CACHE_LOCK:
-        return all((abs_model_path, (name,)) in _TEXT_PE_CACHE for name in clean_names)
+        return all(
+            (abs_model_path, resolved_device, precision, (name,)) in _TEXT_PE_CACHE
+            for name in clean_names
+        )
 
 
 class YoloEBackend:
@@ -55,6 +90,9 @@ class YoloEBackend:
             self.device = "cuda"
         else:
             self.device = "cpu"
+        self.half = _fp16_enabled(self.device)
+        self._classes: Tuple[str, ...] = ()
+        self._text_pe: Optional[torch.Tensor] = None
 
         self._model_key = (os.path.abspath(self.model_path), self.device)
         with _CACHE_LOCK:
@@ -66,6 +104,7 @@ class YoloEBackend:
                 except Exception:
                     if self.device != "cpu":
                         self.device = "cpu"
+                        self.half = False
                         self._model_key = (os.path.abspath(self.model_path), self.device)
                         model.to("cpu")
                 _MODEL_CACHE[self._model_key] = model
@@ -74,21 +113,100 @@ class YoloEBackend:
                 print(f"[YOLOE] reuse cached model: {self.model_path} on {self.device}", flush=True)
             self.model = model
 
+    def _network(self):
+        return getattr(self.model, "model", None)
+
+    def _target_dtype(self) -> torch.dtype:
+        return torch.float16 if self.half and self.device.startswith("cuda") else torch.float32
+
+    def _align_text_features(self) -> None:
+        """Keep YOLOE's plain-tensor text prompt aligned with inference precision."""
+        network = self._network()
+        text_pe = self._text_pe
+        if not torch.is_tensor(text_pe):
+            return
+        try:
+            parameter = next(network.parameters())
+            target_device = parameter.device
+        except Exception:
+            target_device = text_pe.device
+        target_dtype = self._target_dtype()
+        if (
+            torch.is_inference(text_pe)
+            or text_pe.device != target_device
+            or text_pe.dtype != target_dtype
+        ):
+            text_pe = _regular_tensor(text_pe, device=target_device, dtype=target_dtype)
+            self._text_pe = text_pe
+        if self._classes:
+            self.model.set_classes(list(self._classes), text_pe)
+        network.pe = text_pe
+
+    def _ensure_predictor_precision(self) -> None:
+        predictor = getattr(self.model, "predictor", None)
+        auto_backend = getattr(predictor, "model", None)
+        if auto_backend is None:
+            return
+        if bool(getattr(auto_backend, "fp16", False)) != bool(self.half):
+            self.model.predictor = None
+
+    def _switch_to_fp32(self) -> None:
+        """Reset the Ultralytics predictor after an FP16 failure and retry safely."""
+        self.half = False
+        network = self._network()
+        if network is not None:
+            text_pe = self._text_pe
+            if torch.is_tensor(text_pe):
+                try:
+                    parameter = next(network.parameters())
+                    text_pe = _regular_tensor(
+                        text_pe,
+                        device=parameter.device,
+                        dtype=torch.float32,
+                    )
+                except Exception:
+                    text_pe = _regular_tensor(text_pe, dtype=torch.float32)
+                self._text_pe = text_pe
+                network.pe = text_pe
+        # AutoBackend stores its own fp16 flag, so rebuilding is required.
+        self.model.predictor = None
+
     def set_text_classes(self, names: List[str]):
         normalized = tuple(str(n).strip() for n in names if str(n).strip())
         if not normalized:
             return
 
-        cache_key = (self._model_key[0], normalized)
+        precision = "fp16" if self.half else "fp32"
+        cache_key = (self._model_key[0], self.device, precision, normalized)
         with _CACHE_LOCK:
             text_pe = _TEXT_PE_CACHE.get(cache_key)
             if text_pe is None:
                 text_pe = self.model.get_text_pe(list(normalized))
+                network = self._network()
+                try:
+                    parameter = next(network.parameters())
+                    text_pe = _regular_tensor(
+                        text_pe,
+                        device=parameter.device,
+                        dtype=self._target_dtype(),
+                    )
+                except Exception:
+                    text_pe = _regular_tensor(text_pe, dtype=self._target_dtype())
                 _TEXT_PE_CACHE[cache_key] = text_pe
                 print(f"[YOLOE] cached text features: {list(normalized)}", flush=True)
             else:
+                if torch.is_inference(text_pe):
+                    text_pe = _regular_tensor(text_pe)
+                    _TEXT_PE_CACHE[cache_key] = text_pe
                 print(f"[YOLOE] reuse text features: {list(normalized)}", flush=True)
             self.model.set_classes(list(normalized), text_pe)
+            # Ultralytics skips assignment when class names are unchanged. The
+            # embedding is not a parameter/buffer, so assign it explicitly.
+            network = self._network()
+            if network is not None:
+                network.pe = text_pe
+            self._classes = normalized
+            self._text_pe = text_pe
 
     def segment(
         self,
@@ -99,15 +217,29 @@ class YoloEBackend:
         persist: bool = True,
     ) -> Dict[str, Any]:
         with _CACHE_LOCK:
-            r = self.model.track(
-                frame_bgr,
+            self._ensure_predictor_precision()
+            self._align_text_features()
+            kwargs = dict(
                 conf=conf,
                 iou=iou,
                 imgsz=imgsz,
                 persist=persist,
                 tracker=TRACKER_CFG,
                 verbose=False,
-            )[0]
+                device=self.device,
+                half=self.half,
+            )
+            try:
+                with torch.inference_mode():
+                    r = self.model.track(frame_bgr, **kwargs)[0]
+            except Exception:
+                if not self.half:
+                    raise
+                self._switch_to_fp32()
+                kwargs["half"] = False
+                print("[YOLOE] FP16 推理失败，已自动切换到 FP32 并重试", flush=True)
+                with torch.inference_mode():
+                    r = self.model.track(frame_bgr, **kwargs)[0]
 
         out = {"masks": [], "boxes": [], "cls_ids": [], "names": [], "ids": []}
         masks_obj = getattr(r, "masks", None)

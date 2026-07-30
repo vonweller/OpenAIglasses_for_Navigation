@@ -32,6 +32,7 @@ framesize_t g_frame_size = FRAMESIZE_VGA;
 #define JPEG_QUALITY  17
 #define FB_COUNT      2
 volatile int g_target_fps = 0; // 0=不限速，>0 时按指定 FPS 限速发送
+volatile int g_jpeg_quality = JPEG_QUALITY;
 
 // 视频传输性能监控
 volatile unsigned long frame_captured_count = 0;  // 采集帧计数
@@ -39,6 +40,22 @@ volatile unsigned long frame_sent_count = 0;      // 发送帧计数
 volatile unsigned long frame_dropped_count = 0;   // 丢弃帧计数
 volatile unsigned long last_stats_time = 0;       // 上次统计时间
 volatile unsigned long ws_send_fail_count = 0;    // WebSocket 发送失败计数
+volatile unsigned long send_time_sum_ms = 0;
+volatile unsigned long send_time_samples = 0;
+volatile size_t last_jpeg_size = 0;
+unsigned long stats_prev_captured = 0;
+unsigned long stats_prev_sent = 0;
+unsigned long stats_prev_dropped = 0;
+unsigned long stats_prev_send_sum = 0;
+unsigned long stats_prev_send_samples = 0;
+
+// 各通道独立重连，不使用阻塞 delay。
+unsigned long wifi_next_retry_at = 0;
+unsigned long cam_next_retry_at = 0;
+unsigned long aud_next_retry_at = 0;
+unsigned long wifi_retry_ms = 1000;
+unsigned long cam_retry_ms = 800;
+unsigned long aud_retry_ms = 1200;
 
 // ===== Mic (PDM RX) =====
 #define I2S_MIC_CLOCK_PIN 42
@@ -160,7 +177,7 @@ bool init_camera() {
 inline void enqueue_frame(camera_fb_t* fb) {
   if (!fb) return;
   if (xQueueSend(qFrames, &fb, 0) != pdPASS) {
-    // 队列已满，丢弃最旧的帧
+    // 队列长度为 1：拥塞时释放旧帧，只保留最新画面。
     fb_ptr_t drop = nullptr;
     if (xQueueReceive(qFrames, &drop, 0) == pdPASS) {
       if (drop) {
@@ -170,6 +187,62 @@ inline void enqueue_frame(camera_fb_t* fb) {
     }
     xQueueSend(qFrames, &fb, 0);
   }
+}
+
+void clear_frame_queue() {
+  if (!qFrames) return;
+  fb_ptr_t pending = nullptr;
+  while (xQueueReceive(qFrames, &pending, 0) == pdPASS) {
+    if (pending) esp_camera_fb_return(pending);
+    pending = nullptr;
+  }
+}
+
+void send_camera_stats_if_due() {
+  if (!cam_ws_ready) return;
+  unsigned long now = millis();
+  unsigned long elapsed = now - last_stats_time;
+  if (elapsed < 2000) return;
+
+  unsigned long cap_now = frame_captured_count;
+  unsigned long sent_now = frame_sent_count;
+  unsigned long drop_now = frame_dropped_count;
+  unsigned long send_sum_now = send_time_sum_ms;
+  unsigned long send_samples_now = send_time_samples;
+  float seconds = max(0.001f, elapsed / 1000.0f);
+  float capture_fps = (cap_now - stats_prev_captured) / seconds;
+  float send_fps = (sent_now - stats_prev_sent) / seconds;
+  unsigned long sample_delta = send_samples_now - stats_prev_send_samples;
+  float avg_send_ms = sample_delta > 0
+    ? (float)(send_sum_now - stats_prev_send_sum) / (float)sample_delta
+    : 0.0f;
+
+  char payload[320];
+  snprintf(
+    payload,
+    sizeof(payload),
+    "STAT:{\"capture_fps\":%.1f,\"send_fps\":%.1f,\"dropped\":%lu,"
+    "\"send_ms\":%.1f,\"jpeg_bytes\":%u,\"rssi\":%d,\"free_heap\":%u,"
+    "\"target_fps\":%d,\"framesize\":%d,\"jpeg_quality\":%d}",
+    capture_fps,
+    send_fps,
+    drop_now,
+    avg_send_ms,
+    (unsigned int)last_jpeg_size,
+    WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -127,
+    (unsigned int)ESP.getFreeHeap(),
+    g_target_fps,
+    (int)g_frame_size,
+    g_jpeg_quality
+  );
+  wsCam.send(payload);
+
+  stats_prev_captured = cap_now;
+  stats_prev_sent = sent_now;
+  stats_prev_dropped = drop_now;
+  stats_prev_send_sum = send_sum_now;
+  stats_prev_send_samples = send_samples_now;
+  last_stats_time = now;
 }
 
 void taskCamCapture(void*) {
@@ -232,6 +305,9 @@ void taskCamSend(void*) {
         unsigned long send_start = millis();
         bool ok = wsCam.sendBinary((const char*)fb->buf, fb->len);
         unsigned long send_time = millis() - send_start;
+        last_jpeg_size = fb->len;
+        send_time_sum_ms += send_time;
+        send_time_samples++;
         
         if (ok) {
           frame_sent_count++;
@@ -251,6 +327,7 @@ void taskCamSend(void*) {
         }
         
         esp_camera_fb_return(fb);
+        send_camera_stats_if_due();
         
         // 每 5 秒打印一次发送统计
         unsigned long now = millis();
@@ -887,8 +964,17 @@ void setup() {
 
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("[WiFi] connecting");
-  while (WiFi.status()!=WL_CONNECTED){ delay(300); Serial.print("."); }
-  Serial.println(" OK " + WiFi.localIP().toString());
+  unsigned long wifi_wait_started = millis();
+  while (WiFi.status()!=WL_CONNECTED && millis() - wifi_wait_started < 12000) {
+    delay(250);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(" OK " + WiFi.localIP().toString());
+  } else {
+    Serial.println(" timeout；将在主循环中继续非阻塞重连");
+    wifi_next_retry_at = millis();
+  }
 
   if (!init_camera()) { Serial.println("[CAM] init failed, reboot..."); delay(1500); esp_restart(); }
 
@@ -897,7 +983,7 @@ void setup() {
   init_i2s_in();
   init_i2s_out();
 
-  qFrames = xQueueCreate(3, sizeof(fb_ptr_t));  // 使用 3 个缓冲，减少丢帧
+  qFrames = xQueueCreate(1, sizeof(fb_ptr_t));  // 只保留最新帧，避免延迟不断累积
   qAudio  = xQueueCreate(AUDIO_QUEUE_DEPTH, sizeof(AudioChunk));
   qTTS    = xQueueCreate(TTS_QUEUE_DEPTH, sizeof(TTSChunk));
 
@@ -912,14 +998,24 @@ void setup() {
     if (ev == WebsocketsEvent::ConnectionOpened)  { 
       cam_ws_ready = true;  
       Serial.println("[WS-CAM] open");
+      cam_retry_ms = 800;
       // 重置统计
       frame_sent_count = 0;
       frame_dropped_count = 0;
       ws_send_fail_count = 0;
+      send_time_sum_ms = 0;
+      send_time_samples = 0;
+      stats_prev_captured = frame_captured_count;
+      stats_prev_sent = 0;
+      stats_prev_dropped = 0;
+      stats_prev_send_sum = 0;
+      stats_prev_send_samples = 0;
       last_stats_time = millis();
     }
     if (ev == WebsocketsEvent::ConnectionClosed)  { 
       cam_ws_ready = false; 
+      clear_frame_queue();
+      cam_next_retry_at = millis() + cam_retry_ms;
       Serial.printf("[WS-CAM] closed (sent=%lu, dropped=%lu, fail=%lu)\n", 
                     frame_sent_count, frame_dropped_count, ws_send_fail_count);
     }
@@ -932,7 +1028,11 @@ void setup() {
         String v = cmd.substring(strlen("SET:FRAMESIZE="));
         v.toUpperCase();
         framesize_t fs = g_frame_size;
-        if (v == "SVGA") fs = FRAMESIZE_SVGA;
+        if (v == "QQVGA") fs = FRAMESIZE_QQVGA;
+        else if (v == "HQVGA") fs = FRAMESIZE_HQVGA;
+        else if (v == "QVGA") fs = FRAMESIZE_QVGA;
+        else if (v == "CIF") fs = FRAMESIZE_CIF;
+        else if (v == "SVGA") fs = FRAMESIZE_SVGA;
         else if (v == "XGA") fs = FRAMESIZE_XGA;
         else if (v == "VGA") fs = FRAMESIZE_VGA;
         if (apply_framesize(fs)) Serial.printf("[CAM] framesize set to %s\n", v.c_str());
@@ -942,7 +1042,11 @@ void setup() {
         int q = cmd.substring(strlen("SET:QUALITY=")).toInt();
         q = constrain(q, 5, 40);
         sensor_t* s = esp_camera_sensor_get();
-        if (s) { s->set_quality(s, q); Serial.printf("[CAM] quality=%d\n", q); }
+        if (s) {
+          s->set_quality(s, q);
+          g_jpeg_quality = q;
+          Serial.printf("[CAM] quality=%d\n", q);
+        }
       }
       else if (cmd.startsWith("SET:FPS=")) {         // 动态调整发送 FPS
         int f = cmd.substring(strlen("SET:FPS=")).toInt();
@@ -956,7 +1060,7 @@ void setup() {
         snapshot_in_progress = true;
         sensor_t* s = esp_camera_sensor_get();
         framesize_t old_fs = g_frame_size;
-        int old_q = JPEG_QUALITY;
+        int old_q = g_jpeg_quality;
         // 目标分辨率：SXGA；更高分辨率需根据 PSRAM 稳定性调整
         framesize_t target_fs = FRAMESIZE_SXGA;
         if (s) {
@@ -985,9 +1089,20 @@ void setup() {
   });
 
   wsAud.onEvent([](WebsocketsEvent ev, String){
-    if (ev == WebsocketsEvent::ConnectionOpened)  { aud_ws_ready = true;  Serial.println("[WS-AUD] open"); }
+    if (ev == WebsocketsEvent::ConnectionOpened)  {
+      aud_ws_ready = true;
+      aud_retry_ms = 1200;
+      if (qAudio) xQueueReset(qAudio);
+      run_audio_stream = true;
+      wsAud.send("START");
+      startStreamWav();
+      Serial.println("[WS-AUD] open");
+    }
     if (ev == WebsocketsEvent::ConnectionClosed)  { 
       aud_ws_ready = false; 
+      run_audio_stream = false;
+      if (qAudio) xQueueReset(qAudio);
+      aud_next_retry_at = millis() + aud_retry_ms;
       Serial.println("[WS-AUD] closed"); 
       stopStreamWav();
     }
@@ -1004,21 +1119,65 @@ void setup() {
   });
 }
 
+static inline bool retry_due(unsigned long now, unsigned long deadline) {
+  return (long)(now - deadline) >= 0;
+}
+
 void loop() {
-  if (!wsCam.available()) {
-    if (wsCam.connect(SERVER_HOST, SERVER_PORT, CAM_WS_PATH)) {
-      Serial.println("[WS-CAM] connected");
-    } else { Serial.println("[WS-CAM] retry in 1s..."); delay(1000); }
+  static bool wifi_was_connected = false;
+  unsigned long now = millis();
+  bool wifi_connected = WiFi.status() == WL_CONNECTED;
+
+  if (!wifi_connected) {
+    if (wifi_was_connected) {
+      Serial.println("[WiFi] connection lost；pausing camera/audio links");
+      cam_ws_ready = false;
+      aud_ws_ready = false;
+      run_audio_stream = false;
+      clear_frame_queue();
+      wsCam.close();
+      wsAud.close();
+      stopStreamWav();
+      wifi_next_retry_at = now;
+    }
+    wifi_was_connected = false;
+
+    if (retry_due(now, wifi_next_retry_at)) {
+      Serial.printf("[WiFi] reconnecting，next backoff=%lu ms\n", wifi_retry_ms);
+      WiFi.disconnect(false, false);
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      wifi_next_retry_at = now + wifi_retry_ms;
+      wifi_retry_ms = min((unsigned long)15000, wifi_retry_ms * 2);
+    }
+    delay(2);
+    return;
   }
 
-  if (!wsAud.available()) {
-    if (wsAud.connect(SERVER_HOST, SERVER_PORT, AUD_WS_PATH)) {
-      Serial.println("[WS-AUD] connected");
-      delay(50);
-      run_audio_stream = true;
-      wsAud.send("START");
-      startStreamWav();   // /stream.wav (chunked)
-    } else { Serial.println("[WS-AUD] retry in 2s..."); delay(2000); }
+  if (!wifi_was_connected) {
+    wifi_was_connected = true;
+    wifi_retry_ms = 1000;
+    cam_next_retry_at = now;
+    aud_next_retry_at = now;
+    Serial.println("[WiFi] connected " + WiFi.localIP().toString());
+  }
+
+  // 两路 WebSocket 使用独立计时器；一路失败不会阻塞另一路轮询。
+  if (!wsCam.available() && retry_due(now, cam_next_retry_at)) {
+    Serial.println("[WS-CAM] connecting...");
+    if (!wsCam.connect(SERVER_HOST, SERVER_PORT, CAM_WS_PATH)) {
+      cam_next_retry_at = now + cam_retry_ms;
+      cam_retry_ms = min((unsigned long)10000, cam_retry_ms * 2);
+      Serial.printf("[WS-CAM] connect failed，retry in %lu ms\n", cam_retry_ms);
+    }
+  }
+
+  if (!wsAud.available() && retry_due(now, aud_next_retry_at)) {
+    Serial.println("[WS-AUD] connecting...");
+    if (!wsAud.connect(SERVER_HOST, SERVER_PORT, AUD_WS_PATH)) {
+      aud_next_retry_at = now + aud_retry_ms;
+      aud_retry_ms = min((unsigned long)12000, aud_retry_ms * 2);
+      Serial.printf("[WS-AUD] connect failed，retry in %lu ms\n", aud_retry_ms);
+    }
   }
 
   wsCam.poll();
