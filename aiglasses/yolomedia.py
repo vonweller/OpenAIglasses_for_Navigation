@@ -168,9 +168,7 @@ AUDIO_FILES = {
 }
 GUIDANCE_INTERVAL_SEC = 1.5  # 引导播报间隔
 
-# 初始化pygame音频
-if pygame is not None:
-    pygame.mixer.init()
+# pygame 仅作可选依赖保留，不再抢占本机默认声卡。
 
 # ========= 窗口 =========
 WINDOW = "YOLO Seg + Flow Polygon (Peri-Relock) (Grab Guidance)"
