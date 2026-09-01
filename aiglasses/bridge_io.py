@@ -131,7 +131,7 @@ def wait_raw_bgr(timeout_sec: float = 0.5):
     _consumer_state.last_seq = packet.seq
     return packet.bgr
 
-def send_vis_bgr(bgr, quality: int = 80):
+def send_vis_bgr(bgr, quality: int = 88):
     """被 YOLO/MediaPipe 脚本调用：把处理后画面推给前端 viewer"""
     if bgr is None:
         return

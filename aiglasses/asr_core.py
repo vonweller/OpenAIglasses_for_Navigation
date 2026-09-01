@@ -210,8 +210,23 @@ class ASRCallback:
                 self._hot_interrupted = False
                 return
 
-            # ③-b 休眠：不回显、不触发模型
+            # ③-b 休眠：功能指令直接放行；闲聊仍需唤醒
             if not wake_gate.is_active():
+                if wake_gate.is_always_on_command(final_text):
+                    wake_gate.activate()
+                    print(f"[WAKE] 休眠中放行功能指令: '{_shorten(final_text)}'", flush=True)
+                    async def _run_sleep_cmd():
+                        async with self._interrupt_lock:
+                            await self._start_ai(final_text)
+                    try:
+                        self._post(self._ui_final(final_text))
+                        self._post(_run_sleep_cmd())
+                    except Exception:
+                        pass
+                    self._last_partial_for_ui = ""
+                    self._last_final_text = ""
+                    self._hot_interrupted = False
+                    return
                 now_ts = time.time()
                 if now_ts - getattr(self, "_last_sleep_hint", 0.0) > 30.0:
                     self._last_sleep_hint = now_ts

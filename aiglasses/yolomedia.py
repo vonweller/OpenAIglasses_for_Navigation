@@ -732,8 +732,19 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
             )
             print(f"[DETECTOR] YOLOE text-prompt backend enabled for: {PROMPT_NAME}", flush=True)
         except Exception as e:
-            print(f"[DETECTOR] YOLOE init failed: {e}", flush=True)
-            bridge_io.set_yolo_status(running=False, phase="failed", target=PROMPT_NAME, last_error=str(e))
+            technical_error = str(e)
+            if "same dtype" in technical_error or "Half != float" in technical_error:
+                user_error = "视觉模型精度不兼容，正在恢复，请再试一次寻找。"
+            else:
+                user_error = "视觉模型初始化失败，找物暂不可用。"
+            print(f"[DETECTOR] YOLOE init failed: {technical_error}", flush=True)
+            bridge_io.set_yolo_status(
+                running=False,
+                phase="failed",
+                target=PROMPT_NAME,
+                last_error=user_error,
+                technical_error=technical_error,
+            )
     else:
         print("[DETECTOR] YOLOE backend not ready (import failed)", flush=True)
         bridge_io.set_yolo_status(running=False, phase="failed", target=PROMPT_NAME, last_error="YOLOE backend import failed")

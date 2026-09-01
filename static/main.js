@@ -472,7 +472,20 @@
             continue;
           }
           fitCanvas();
-          ctx.drawImage(drawable, 0, 0, canvas.width, canvas.height);
+          const cw = canvas.width;
+          const ch = canvas.height;
+          const iw = drawable.width || 1;
+          const ih = drawable.height || 1;
+          const scale = Math.min(cw / iw, ch / ih);
+          const dw = Math.max(1, Math.round(iw * scale));
+          const dh = Math.max(1, Math.round(ih * scale));
+          const dx = Math.floor((cw - dw) / 2);
+          const dy = Math.floor((ch - dh) / 2);
+          ctx.fillStyle = '#05080d';
+          ctx.fillRect(0, 0, cw, ch);
+          ctx.imageSmoothingEnabled = scale < 1;
+          ctx.imageSmoothingQuality = 'high';
+          ctx.drawImage(drawable, dx, dy, dw, dh);
           markFrameDrawn();
         } catch (e) {
           localDecodeDrops++;

@@ -24,9 +24,9 @@ class PerformanceProfile:
 
 
 PROFILES: Dict[str, PerformanceProfile] = {
-    "smooth": PerformanceProfile("smooth", "流畅", "QVGA", 320, 240, 25, 22, 320, 12.5),
-    "balanced": PerformanceProfile("balanced", "平衡", "VGA", 640, 480, 20, 20, 416, 10.0),
-    "quality": PerformanceProfile("quality", "清晰", "SVGA", 800, 600, 15, 18, 512, 7.5),
+    "smooth": PerformanceProfile("smooth", "流畅", "VGA", 640, 480, 24, 14, 384, 12.0),
+    "balanced": PerformanceProfile("balanced", "平衡", "VGA", 640, 480, 20, 12, 512, 10.0),
+    "quality": PerformanceProfile("quality", "清晰", "SVGA", 800, 600, 15, 10, 640, 7.5),
 }
 DEFAULT_PROFILE = "balanced"
 

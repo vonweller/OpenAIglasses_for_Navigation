@@ -21,7 +21,7 @@ using namespace websockets;
 // ===== WiFi / Server =====
 const char* WIFI_SSID   = "LYT";
 const char* WIFI_PASS   = "lyt13509018386";
-const char* SERVER_HOST = " 192.168.10.71";
+const char* SERVER_HOST = "192.168.10.57";
 const uint16_t SERVER_PORT = 8081;
 
 static const char* CAM_WS_PATH = "/ws/camera";
@@ -32,7 +32,7 @@ static const char* AUD_WS_PATH = "/ws_audio";
 #include "camera_pins.h"
 
 framesize_t g_frame_size = FRAMESIZE_VGA;
-#define JPEG_QUALITY  17
+#define JPEG_QUALITY  12
 #define FB_COUNT      2
 volatile int g_target_fps = 0; // 0=不限速，>0 时按指定 FPS 限速发送
 volatile int g_jpeg_quality = JPEG_QUALITY;
@@ -291,7 +291,7 @@ void taskCamCapture(void*) {
 static uint8_t* s_jpeg_copy = nullptr;
 static size_t   s_jpeg_copy_cap = 0;
 static unsigned long s_last_send_ms = 0;
-const size_t JPEG_COPY_MAX = 96 * 1024;
+const size_t JPEG_COPY_MAX = 256 * 1024;
 
 static bool jpeg_copy_prepare(size_t n) {
   if (n == 0 || n > JPEG_COPY_MAX) return false;

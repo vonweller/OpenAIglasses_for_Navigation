@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """语音助手唤醒门：唤醒词 -> 激活窗口 -> 超时退出。
 
-- 休眠：ASR 识别照常，但只有命中唤醒词才会进入激活，不会触发模型交互。
+- 休眠：ASR 识别照常。闲聊 / 看图问答需先说唤醒词；找物、导航、过马路、红绿灯等功能指令仍立即执行。
 - 激活：ACTIVE_WINDOW_SEC 秒内的正常语音照旧走 LLM/指令；每次有效交互刷新窗口。
 - 超时：窗口到期自动回到休眠。
 """
@@ -14,6 +14,34 @@ from typing import List, Optional
 # 唤醒词（标准化后匹配，标点/空格忽略）。可用环境变量 AIGLASS_WAKE_WORDS 覆盖，逗号分隔。
 DEFAULT_WAKE_WORDS = "你好智能助手"
 ACTIVE_WINDOW_SEC = max(5.0, float(os.getenv("AIGLASS_WAKE_WINDOW_SEC", "15")))
+
+# 休眠时仍立即执行的功能指令。闲聊 / 看图问答仍需先唤醒，避免误触发模型。
+ALWAYS_ON_KEYWORDS = (
+    "开始导航",
+    "盲道导航",
+    "帮我导航",
+    "停止导航",
+    "结束导航",
+    "开始过马路",
+    "帮我过马路",
+    "过马路结束",
+    "结束过马路",
+    "检测红绿灯",
+    "看红绿灯",
+    "停止检测",
+    "停止红绿灯",
+    "立即通过",
+    "现在通过",
+    "找到了",
+    "拿到了",
+    "收到",
+    "停止找物",
+    "结束找物",
+)
+_FIND_RE = re.compile(
+    r"(?:帮我|请|麻烦)?\s*(?:找一下|找一找|找一个|找找|寻找|搜索|识别一下|检测一下|找)\s*\S+"
+    r"|.+(?:在哪里|在哪儿|在哪|哪里|的位置)"
+)
 
 _PUNCT_RE = re.compile(r"[\s，。！？!?,.、·~～:：;；'\"“”‘’()（）\[\]【】]+")
 _PUNCT_SET = "，。！？!?,. 、·~～:：;；'\"“”‘’()（）[]【】"
@@ -38,6 +66,16 @@ def is_wake_phrase(text: str) -> bool:
     if not norm:
         return False
     return any(w in norm for w in _wake_words())
+
+
+def is_always_on_command(text: str) -> bool:
+    """功能指令在休眠时也应直接执行，不要求先说唤醒词。"""
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    if any(k in raw for k in ALWAYS_ON_KEYWORDS):
+        return True
+    return bool(_FIND_RE.search(raw))
 
 
 def _wake_span(text: str, keyword: str) -> Optional[tuple]:

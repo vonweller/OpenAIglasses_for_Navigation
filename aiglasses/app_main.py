@@ -48,7 +48,7 @@ if sys.platform.startswith("win"):
 # ---- .env ----
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(override=True)
 except Exception:
     pass
 
@@ -106,7 +106,11 @@ if sys.platform.startswith("win"):
 # ---- DashScope ASR 基础 ----
 from dashscope import audio as dash_audio  # 若未安装，会在原项目里抛错提示
 
-API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
+def _normalize_api_key(value: str) -> str:
+    return str(value or "").strip().strip('"').strip("'")
+
+
+API_KEY = _normalize_api_key(os.getenv("DASHSCOPE_API_KEY", ""))
 
 MODEL        = "paraformer-realtime-v2"
 SAMPLE_RATE  = 16000
@@ -388,7 +392,7 @@ def _visual_worker() -> None:
             frame_age_ms=max(0.0, (time.time() - packet.captured_at) * 1000.0),
             last_error="",
         )
-        bridge_io.send_vis_bgr(out_img if out_img is not None else packet.bgr, quality=78)
+        bridge_io.send_vis_bgr(out_img if out_img is not None else packet.bgr, quality=88)
         if guidance_text:
             try:
                 play_voice_text(guidance_text)
@@ -674,13 +678,19 @@ def start_yolomedia_with_target(target_name: str, display_name: Optional[str] = 
                     prewarm_yoloe([yolo_class])
                     print(f"[YOLOMEDIA] lazy prewarm finished for: {yolo_class}", flush=True)
                 except Exception as exc:
-                    print(f"[YOLOMEDIA] lazy prewarm failed for {yolo_class}: {exc}", flush=True)
+                    technical_error = str(exc)
+                    if "same dtype" in technical_error or "Half != float" in technical_error:
+                        user_error = "视觉模型精度不兼容，正在恢复，请再试一次寻找。"
+                    else:
+                        user_error = "视觉特征准备失败，将继续尝试初始化。"
+                    print(f"[YOLOMEDIA] lazy prewarm failed for {yolo_class}: {technical_error}", flush=True)
                     bridge_io.set_yolo_status(
                         running=True,
                         phase="lazy_prewarm_failed",
                         target=yolo_class,
                         backend="YOLOE",
-                        last_error=str(exc),
+                        last_error=user_error,
+                        technical_error=technical_error,
                     )
                 if yolomedia_stop_event.is_set():
                     print(f"[YOLOMEDIA] lazy prewarm cancelled for: {yolo_class}", flush=True)
@@ -1229,7 +1239,7 @@ async def update_runtime_config(request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    new_key = str(body.get("dashscope_api_key") or "").strip()
+    new_key = _normalize_api_key(body.get("dashscope_api_key") or "")
     if new_key:
         API_KEY = new_key
         os.environ["DASHSCOPE_API_KEY"] = new_key
@@ -1407,7 +1417,7 @@ async def ws_ui(ws: WebSocket):
 # ---------- WebSocket：ESP32 音频入口（ASR 上行） ----------
 @app.websocket("/ws_audio")
 async def ws_audio(ws: WebSocket):
-    global esp32_audio_ws
+    global esp32_audio_ws, API_KEY
     esp32_audio_ws = ws
     await ws.accept()
     _set_asr_diag(audio_ws_connected=True, streaming=False, last_error="")
@@ -1436,8 +1446,23 @@ async def ws_audio(ws: WebSocket):
             except Exception: pass
 
     async def on_sdk_error(_msg: str):
-        print(f"[ASR ERROR] {_msg}", flush=True)
-        _set_asr_diag(last_error=str(_msg), streaming=False)
+        text = str(_msg)
+        print(f"[ASR ERROR] {text}", flush=True)
+        _set_asr_diag(last_error=text, streaming=False)
+        lowered = text.lower()
+        auth_fail = (
+            '"status_code": 401' in text
+            or "code': 401" in text
+            or "api-key is invalid" in lowered
+            or "unauthorized" in lowered
+        )
+        if auth_fail:
+            await stop_rec(send_notice="ERR:INVALID_API_KEY")
+            try:
+                await ui_broadcast_final("[系统] 语音识别密钥无效，请更新 DASHSCOPE_API_KEY 后重连麦克风")
+            except Exception:
+                pass
+            return
         await stop_rec(send_notice="RESTART")
 
     async def keepalive_loop():
@@ -1477,6 +1502,11 @@ async def ws_audio(ws: WebSocket):
                 if cmd == "START":
                     print("[AUDIO] START received")
                     _set_asr_diag(last_command="START", last_error="", audio_chunks=0)
+                    try:
+                        load_dotenv(override=True)
+                    except Exception:
+                        pass
+                    API_KEY = _normalize_api_key(os.getenv("DASHSCOPE_API_KEY", API_KEY))
                     if not API_KEY:
                         msg = "missing DASHSCOPE_API_KEY"
                         print(f"[ASR ERROR] {msg}", flush=True)
