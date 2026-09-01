@@ -1,5 +1,7 @@
 // ===== all_in_one_merged.ino — XIAO ESP32S3 Sense: Camera + Mic (PDM) + IMU (ICM42688 SPI) =====
-// ===== 版本: v2.4-SPIIMU - ICM42688 改为 SPI，避开 I2S 干扰；保留 WAV 分块播放 =====
+// ===== 版本: v2.6-SPIIMU - 关闭喇叭播放（硬件损坏）；相机发送不阻塞缓冲 =====
+// SPEAKER_ENABLED=0 时：不初始化 I2S TX，也不拉 /stream.wav，音频只在服务端播放
+#define SPEAKER_ENABLED 0
 
 #include <WiFi.h>
 #include <esp_wifi.h>
@@ -13,12 +15,13 @@ struct WavFmt;
 #include <WiFiUdp.h>
 #include <WiFiClient.h> 
 #include <SPI.h>        // ICM42688 使用 SPI
+#include <esp_heap_caps.h>
 using namespace websockets;
 
 // ===== WiFi / Server =====
 const char* WIFI_SSID   = "LYT";
 const char* WIFI_PASS   = "lyt13509018386";
-const char* SERVER_HOST = "192.168.10.6";
+const char* SERVER_HOST = " 192.168.10.71";
 const uint16_t SERVER_PORT = 8081;
 
 static const char* CAM_WS_PATH = "/ws/camera";
@@ -98,7 +101,8 @@ typedef struct {
 } AudioChunk;
 QueueHandle_t qAudio;
 
-#define TTS_QUEUE_DEPTH 48
+// TTS 分片通道默认不启用；队列太深会吃掉约 90KB 内部堆，压缩到 4
+#define TTS_QUEUE_DEPTH 4
 typedef struct { uint16_t n; uint8_t data[2048]; } TTSChunk;
 QueueHandle_t qTTS;
 volatile bool tts_playing = false;
@@ -283,6 +287,24 @@ void taskCamCapture(void*) {
   }
 }
 
+// JPEG 发送拷贝缓冲：发送期间不再占用相机帧缓冲（VGA 只有 2 块，占住会导致采集饿死）
+static uint8_t* s_jpeg_copy = nullptr;
+static size_t   s_jpeg_copy_cap = 0;
+static unsigned long s_last_send_ms = 0;
+const size_t JPEG_COPY_MAX = 96 * 1024;
+
+static bool jpeg_copy_prepare(size_t n) {
+  if (n == 0 || n > JPEG_COPY_MAX) return false;
+  if (s_jpeg_copy && s_jpeg_copy_cap >= n) return true;
+  size_t cap = n < 24 * 1024 ? 24 * 1024 : n;
+  uint8_t* p = (uint8_t*)heap_caps_realloc(s_jpeg_copy, cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!p) p = (uint8_t*)heap_caps_realloc(s_jpeg_copy, cap, MALLOC_CAP_8BIT);
+  if (!p) return false;
+  s_jpeg_copy = p;
+  s_jpeg_copy_cap = cap;
+  return true;
+}
+
 void taskCamSend(void*) {
   static TickType_t lastTick = 0;
   unsigned long last_log = 0;
@@ -293,7 +315,29 @@ void taskCamSend(void*) {
     fb_ptr_t fb = nullptr;
     if (xQueueReceive(qFrames, &fb, pdMS_TO_TICKS(100)) == pdPASS) {
       if (fb && cam_ws_ready) {
-        // 发送节流：设置目标 FPS 后按周期发送，多余帧由 qFrames 机制丢弃
+        const size_t jpeg_len = fb->len;
+        last_jpeg_size = jpeg_len;
+
+        // 上一帧发送已超过 150ms 说明链路拥塞：丢弃本帧，优先把缓冲还给相机
+        if (s_last_send_ms >= 150) {
+          esp_camera_fb_return(fb);
+          frame_dropped_count++;
+          s_last_send_ms = 75; // 下一帧再试，避免连续丢
+          continue;
+        }
+
+        if (!jpeg_copy_prepare(jpeg_len)) {
+          Serial.printf("[CAM-SEND] copy alloc failed size=%u heap=%u\n",
+                        (unsigned)jpeg_len, (unsigned)ESP.getFreeHeap());
+          esp_camera_fb_return(fb);
+          frame_dropped_count++;
+          continue;
+        }
+        memcpy(s_jpeg_copy, fb->buf, jpeg_len);
+        esp_camera_fb_return(fb);
+        fb = nullptr;
+
+        // 发送节流放在归还相机缓冲之后，避免双缓冲被限速占住
         if (g_target_fps > 0) {
           const int period_ms = 1000 / g_target_fps;
           TickType_t now = xTaskGetTickCount();
@@ -303,9 +347,9 @@ void taskCamSend(void*) {
         }
         
         unsigned long send_start = millis();
-        bool ok = wsCam.sendBinary((const char*)fb->buf, fb->len);
+        bool ok = wsCam.sendBinary((const char*)s_jpeg_copy, jpeg_len);
         unsigned long send_time = millis() - send_start;
-        last_jpeg_size = fb->len;
+        s_last_send_ms = send_time;
         send_time_sum_ms += send_time;
         send_time_samples++;
         
@@ -315,26 +359,24 @@ void taskCamSend(void*) {
           
           // 监控发送耗时
           if (send_time > 100) {
-            Serial.printf("[CAM-SEND] WARNING: send took %lu ms (size=%u)\n", send_time, fb->len);
+            Serial.printf("[CAM-SEND] WARNING: send took %lu ms (size=%u)\n", send_time, (unsigned)jpeg_len);
           }
         } else {
           ws_send_fail_count++;
           Serial.println("[CAM-SEND] ERROR: WebSocket send failed, closing...");
-          esp_camera_fb_return(fb);
           wsCam.close(); 
           cam_ws_ready = false;
           continue;
         }
         
-        esp_camera_fb_return(fb);
         send_camera_stats_if_due();
         
         // 每 5 秒打印一次发送统计
         unsigned long now = millis();
         if (now - last_log > 5000) {
           unsigned long gap = now - last_sent_time;
-          Serial.printf("[CAM-SEND] sent=%lu, dropped=%lu, ws_fail=%lu, last_gap=%lu ms\n", 
-                        frame_sent_count, frame_dropped_count, ws_send_fail_count, gap);
+          Serial.printf("[CAM-SEND] sent=%lu, dropped=%lu, ws_fail=%lu, last_gap=%lu ms, last_send=%lu ms\n", 
+                        frame_sent_count, frame_dropped_count, ws_send_fail_count, gap, s_last_send_ms);
           last_log = now;
         }
         
@@ -981,7 +1023,11 @@ void setup() {
   udp.begin(0);
 
   init_i2s_in();
+#if SPEAKER_ENABLED
   init_i2s_out();
+#else
+  Serial.println("[AUDIO] 喇叭已禁用（SPEAKER_ENABLED=0），不启动 I2S TX");
+#endif
 
   qFrames = xQueueCreate(1, sizeof(fb_ptr_t));  // 只保留最新帧，避免延迟不断累积
   qAudio  = xQueueCreate(AUDIO_QUEUE_DEPTH, sizeof(AudioChunk));
@@ -1095,7 +1141,9 @@ void setup() {
       if (qAudio) xQueueReset(qAudio);
       run_audio_stream = true;
       wsAud.send("START");
+#if SPEAKER_ENABLED
       startStreamWav();
+#endif
       Serial.println("[WS-AUD] open");
     }
     if (ev == WebsocketsEvent::ConnectionClosed)  { 
