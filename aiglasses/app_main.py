@@ -70,6 +70,7 @@ MODEL_CONFIG_FIELDS = {
     "item_search_model": ("YOLOE_MODEL_PATH", DEFAULT_ITEM_MODEL),
 }
 PERFORMANCE_PROFILE = DEFAULT_PROFILE
+PLAYBACK_TARGET = "server"
 
 def _load_runtime_config_env():
     global PERFORMANCE_PROFILE
@@ -77,11 +78,14 @@ def _load_runtime_config_env():
         with open(RUNTIME_CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
-        return
+        data = {}
     if isinstance(data, dict):
         PERFORMANCE_PROFILE = normalize_profile(data.get("performance_profile", DEFAULT_PROFILE))
         os.environ["AIGLASS_PERFORMANCE_PROFILE"] = PERFORMANCE_PROFILE
         os.environ["AIGLASS_YOLOE_IMGSZ"] = str(PROFILES[PERFORMANCE_PROFILE].yolo_imgsz)
+        playback = str(data.get("playback_target") or os.getenv("AIGLASS_PLAYBACK_TARGET", PLAYBACK_TARGET)).strip()
+        if playback:
+            os.environ["AIGLASS_PLAYBACK_TARGET"] = playback
     models = data.get("models", data) if isinstance(data, dict) else {}
     if not isinstance(models, dict):
         return
@@ -122,6 +126,9 @@ from .audio_stream import (
     is_playing_now,
     current_ai_task,
     get_stream_status,
+    get_playback_target,
+    set_playback_target,
+    normalize_playback_target,
 )
 from .omni_client import stream_chat, OmniStreamPiece
 from .asr_core import (
@@ -130,6 +137,10 @@ from .asr_core import (
     stop_current_recognition,
 )
 from .audio_player import initialize_audio_system, play_voice_text
+
+PLAYBACK_TARGET = set_playback_target(os.getenv("AIGLASS_PLAYBACK_TARGET", PLAYBACK_TARGET))
+
+from . import wake_gate
 
 # ---- 同步录制器 ----
 from . import sync_recorder
@@ -397,6 +408,7 @@ def _persist_runtime_config(models: Optional[dict] = None) -> None:
     if models is not None:
         existing["models"] = dict(models)
     existing["performance_profile"] = PERFORMANCE_PROFILE
+    existing["playback_target"] = PLAYBACK_TARGET
     try:
         with open(RUNTIME_CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(existing, f, ensure_ascii=False, indent=2)
@@ -987,6 +999,8 @@ async def start_ai_with_text(user_text: str):
                 pass
         finally:
             await finish_pcm16_stream()
+            # AI 回答播完后再给用户一个完整窗口继续对话
+            wake_gate.touch()
             # 【修改】标记omni对话结束，恢复之前的导航模式
             global omni_conversation_active, omni_previous_nav_state
             omni_conversation_active = False
@@ -1053,6 +1067,8 @@ def _device_status_payload() -> dict:
         "item_search_running": bool(yolomedia_running),
         "item_search_target": current_item_target_zh,
         "audio_stream": get_stream_status(),
+        "playback_target": PLAYBACK_TARGET,
+        "wake": wake_gate.snapshot(),
         "yolo": yolo_status,
         "pipeline": pipeline_metrics.snapshot(),
         "frame_buffer": bridge_io.get_frame_stats(),
@@ -1192,6 +1208,7 @@ def runtime_config(request: Request):
             "imu_udp": "ESP32 IMU UDP JSON 发送目标",
         },
         "performance_profile": PERFORMANCE_PROFILE,
+        "playback_target": PLAYBACK_TARGET,
         "performance_profiles": {
             key: profile_payload(key)
             for key in PROFILES
@@ -1207,7 +1224,7 @@ def runtime_config(request: Request):
 
 @app.post("/api/runtime-config")
 async def update_runtime_config(request: Request):
-    global API_KEY
+    global API_KEY, PLAYBACK_TARGET
     try:
         body = await request.json()
     except Exception:
@@ -1225,6 +1242,7 @@ async def update_runtime_config(request: Request):
             pass
     requested_profile = str(body.get("performance_profile") or PERFORMANCE_PROFILE)
     profile = _apply_performance_profile(requested_profile)
+    PLAYBACK_TARGET = set_playback_target(body.get("playback_target") or PLAYBACK_TARGET)
     model_updates = {
         field: (env_key, str(body.get(field) or "").strip())
         for field, (env_key, _default) in MODEL_CONFIG_FIELDS.items()
@@ -1259,6 +1277,7 @@ async def update_runtime_config(request: Request):
         "api_key_masked": _mask_key(API_KEY),
         "saved_models": saved_models,
         "performance_profile": profile,
+        "playback_target": PLAYBACK_TARGET,
     }
 
 
@@ -1289,6 +1308,10 @@ async def dev_command(request: Request):
         body = {}
     command = str(body.get("command") or "").strip().lower()
     target = str(body.get("target") or "手机").strip() or "手机"
+
+    # 页面按钮属于显式操作，直接唤醒并刷新窗口，方便语音追问
+    if command != "chat":
+        wake_gate.activate()
 
     if command in ("find", "item_search"):
         label_en, source = extract_english_label(target)

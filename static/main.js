@@ -313,14 +313,17 @@
     setBadge($modeStatus, modeTone !== 'warn', `运行模式：${modeText}`, modeTone);
 
     const stream = data?.audio_stream || {};
-    const clients = Number(stream.clients || 0);
     const age = stream.last_broadcast_age_sec;
-    let text = clients > 0 ? `扬声器：已连接（${clients}）` : '扬声器：未连接播放端';
-    let tone = clients > 0 ? 'ok' : 'warn';
-    if (age !== null && age !== undefined && Number.isFinite(Number(age)) && Number(age) < 3) {
-      text += '，正在播放';
+    const playing = age !== null && age !== undefined && Number.isFinite(Number(age)) && Number(age) < 3;
+    const localErr = String(stream.local_player_error || '').trim();
+    let text = '音频播放：服务端电脑';
+    let tone = 'ok';
+    if (localErr) {
+      text = '音频播放：服务端电脑（失败）';
+      tone = 'err';
     }
-    setBadge($speakerStatus, clients > 0, text, tone);
+    if (playing) text += '，正在播放';
+    setBadge($speakerStatus, tone === 'ok', text, tone);
   }
 
   function updatePerformance(data) {
@@ -365,11 +368,15 @@
         ctx.fillRect(0, 0, canvas.width, canvas.height);
       }
     }
+    const wake = data?.wake || {};
+    const wakeSuffix = wake.active
+      ? `，已唤醒（剩余 ${Math.ceil(Number(wake.remaining_sec || 0))} 秒）`
+      : '，助手休眠';
     if (data.audio_connected && data.asr_streaming) {
       const chunks = Number(data.asr_audio_chunks || 0);
-      setBadge($audioStatusStage, true, `麦克风：识别中（${chunks} 个音频块）`);
+      setBadge($audioStatusStage, wake.active, `麦克风：识别中（${chunks} 个音频块）${wakeSuffix}`, wake.active ? 'ok' : 'warn');
     } else if (data.audio_connected) {
-      setBadge($audioStatusStage, true, '麦克风：已连接，语音识别未启动');
+      setBadge($audioStatusStage, wake.active, `麦克风：已连接，语音识别未启动${wakeSuffix}`, wake.active ? 'ok' : 'warn');
     } else {
       setBadge($audioStatusStage, false, '麦克风：等待接入', 'warn');
     }
@@ -527,7 +534,7 @@
             data.finals.forEach(text => {
               if (text.startsWith('[AI]')) {
                 addMessage(text.substring(4).trim(), false);
-              } else if (text.startsWith('[导航]')) {
+              } else if (text.startsWith('[导航]') || text.startsWith('[系统]')) {
                 const { text: show } = navLabelAndText(text);
                 addMessage(show, false);
               } else {
@@ -546,7 +553,7 @@
         const text = s.slice(6);
         if (text.startsWith('[AI]')) {
           addMessage(text.substring(4).trim(), false);
-        } else if (text.startsWith('[导航]')) {
+        } else if (text.startsWith('[导航]') || text.startsWith('[系统]')) {
           const { text: show } = navLabelAndText(text);
           addMessage(show, false); // 左侧 AI
         } else {
