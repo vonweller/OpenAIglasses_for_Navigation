@@ -244,6 +244,17 @@ async def _broadcast_audio_optimized(pcm_data: bytes):
         with _playing_lock:
             _is_playing = False
 
+def is_voice_playing() -> bool:
+    """预录提示音正在入队或正在送往扬声器。"""
+    with _playing_lock:
+        if _is_playing:
+            return True
+    try:
+        return _audio_queue.qsize() > 0
+    except Exception:
+        return False
+
+
 def initialize_audio_system():
     """初始化音频系统"""
     global _initialized, _worker_thread, _last_play_ts

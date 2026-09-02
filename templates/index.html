@@ -218,6 +218,17 @@
     border:1px solid #26364c; border-radius:8px;
     padding:6px 9px; font-size:12px;
   }
+  .toggle-card{
+    display:flex; gap:10px; align-items:flex-start;
+    padding:8px 9px; border:1px solid #1b2a3e; border-radius:8px;
+    background:#08111a;
+  }
+  .toggle-card input[type="checkbox"]{
+    width:16px; height:16px; margin:2px 0 0 0; flex:0 0 auto; accent-color:#1f6feb;
+  }
+  .toggle-copy{min-width:0}
+  .toggle-copy strong{display:block; color:#dce9f7; font-size:12px; font-weight:700}
+  .toggle-copy small{display:block; color:var(--muted); font-size:11px; line-height:1.45; margin-top:2px}
   .perf-grid{
     display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px;
     margin-top:8px;
@@ -553,6 +564,13 @@
               <option value="quality">清晰（800×600 / 15 帧）</option>
             </select>
           </div>
+          <label class="toggle-card" for="muteMicDuringPlaybackInput">
+            <input id="muteMicDuringPlaybackInput" type="checkbox" checked>
+            <span class="toggle-copy">
+              <strong>播报时暂停麦克风</strong>
+              <small>电脑或云端喇叭出声时，不把麦克风音频送去语音识别，避免把播报内容再次推理。</small>
+            </span>
+          </label>
           <div class="config-section-title">模型路径</div>
           <div class="field-row">
             <label for="blindPathModelInput">盲道分割</label>
@@ -645,6 +663,6 @@
 }</script>
 
 <!-- 主脚本 -->
-<script type="module" src="/static/main.js?v=20260730-perf3"></script>
+<script type="module" src="/static/main.js?v=20260706-mutemic"></script>
 </body>
 </html>

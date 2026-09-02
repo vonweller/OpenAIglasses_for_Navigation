@@ -64,6 +64,9 @@ python tools/desktop_esp32_simulator.py --host 127.0.0.1 --port 8081
 - `Speaker: connected (...)`：有客户端正在监听 `/stream.wav`
 - `Mode: CHAT / ITEM_SEARCH / BLINDPATH_NAV / TRAFFIC_LIGHT_DETECTION / CROSSING`：当前后端模式
 - `YOLO: ...`：找物 YOLOE 状态
+- `麦克风：播报中已暂停推送`：页面开启了「播报时暂停麦克风」，电脑/云端喇叭出声时不把麦克风送去 ASR
+
+右侧「设备接入 / 运行配置」里有开关 **播报时暂停麦克风**（默认开启，改动立即保存）。开启后，导航提示音和 Qwen 语音播报期间，`/ws_audio` 收到的麦克风 PCM 会改成静音再进识别，播报结束后约 0.8 秒恢复，避免喇叭声音被再次推理。
 
 接口也可以直接查看：
 

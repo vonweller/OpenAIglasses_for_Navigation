@@ -71,9 +71,24 @@ MODEL_CONFIG_FIELDS = {
 }
 PERFORMANCE_PROFILE = DEFAULT_PROFILE
 PLAYBACK_TARGET = "server"
+MUTE_MIC_DURING_PLAYBACK = True
+
+
+def _as_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return default
+
 
 def _load_runtime_config_env():
-    global PERFORMANCE_PROFILE
+    global PERFORMANCE_PROFILE, MUTE_MIC_DURING_PLAYBACK
     try:
         with open(RUNTIME_CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -86,6 +101,11 @@ def _load_runtime_config_env():
         playback = str(data.get("playback_target") or os.getenv("AIGLASS_PLAYBACK_TARGET", PLAYBACK_TARGET)).strip()
         if playback:
             os.environ["AIGLASS_PLAYBACK_TARGET"] = playback
+        if "mute_mic_during_playback" in data:
+            MUTE_MIC_DURING_PLAYBACK = _as_bool(data.get("mute_mic_during_playback"), True)
+        env_mute = os.getenv("AIGLASS_MUTE_MIC_DURING_PLAYBACK")
+        if env_mute not in (None, ""):
+            MUTE_MIC_DURING_PLAYBACK = _as_bool(env_mute, MUTE_MIC_DURING_PLAYBACK)
     models = data.get("models", data) if isinstance(data, dict) else {}
     if not isinstance(models, dict):
         return
@@ -128,6 +148,7 @@ from .audio_stream import (
     soft_reset_audio,
     BYTES_PER_20MS_16K,
     is_playing_now,
+    is_output_playing,
     current_ai_task,
     get_stream_status,
     get_playback_target,
@@ -413,6 +434,7 @@ def _persist_runtime_config(models: Optional[dict] = None) -> None:
         existing["models"] = dict(models)
     existing["performance_profile"] = PERFORMANCE_PROFILE
     existing["playback_target"] = PLAYBACK_TARGET
+    existing["mute_mic_during_playback"] = bool(MUTE_MIC_DURING_PLAYBACK)
     try:
         with open(RUNTIME_CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(existing, f, ensure_ascii=False, indent=2)
@@ -1078,6 +1100,8 @@ def _device_status_payload() -> dict:
         "item_search_target": current_item_target_zh,
         "audio_stream": get_stream_status(),
         "playback_target": PLAYBACK_TARGET,
+        "mute_mic_during_playback": bool(MUTE_MIC_DURING_PLAYBACK),
+        "mic_muted": bool(MUTE_MIC_DURING_PLAYBACK and is_output_playing()),
         "wake": wake_gate.snapshot(),
         "yolo": yolo_status,
         "pipeline": pipeline_metrics.snapshot(),
@@ -1219,6 +1243,7 @@ def runtime_config(request: Request):
         },
         "performance_profile": PERFORMANCE_PROFILE,
         "playback_target": PLAYBACK_TARGET,
+        "mute_mic_during_playback": bool(MUTE_MIC_DURING_PLAYBACK),
         "performance_profiles": {
             key: profile_payload(key)
             for key in PROFILES
@@ -1234,7 +1259,7 @@ def runtime_config(request: Request):
 
 @app.post("/api/runtime-config")
 async def update_runtime_config(request: Request):
-    global API_KEY, PLAYBACK_TARGET
+    global API_KEY, PLAYBACK_TARGET, MUTE_MIC_DURING_PLAYBACK
     try:
         body = await request.json()
     except Exception:
@@ -1253,6 +1278,9 @@ async def update_runtime_config(request: Request):
     requested_profile = str(body.get("performance_profile") or PERFORMANCE_PROFILE)
     profile = _apply_performance_profile(requested_profile)
     PLAYBACK_TARGET = set_playback_target(body.get("playback_target") or PLAYBACK_TARGET)
+    if "mute_mic_during_playback" in body:
+        MUTE_MIC_DURING_PLAYBACK = _as_bool(body.get("mute_mic_during_playback"), MUTE_MIC_DURING_PLAYBACK)
+        os.environ["AIGLASS_MUTE_MIC_DURING_PLAYBACK"] = "1" if MUTE_MIC_DURING_PLAYBACK else "0"
     model_updates = {
         field: (env_key, str(body.get(field) or "").strip())
         for field, (env_key, _default) in MODEL_CONFIG_FIELDS.items()
@@ -1288,6 +1316,7 @@ async def update_runtime_config(request: Request):
         "saved_models": saved_models,
         "performance_profile": profile,
         "playback_target": PLAYBACK_TARGET,
+        "mute_mic_during_playback": bool(MUTE_MIC_DURING_PLAYBACK),
     }
 
 
@@ -1546,7 +1575,7 @@ async def ws_audio(ws: WebSocket):
                     await set_current_recognition(recognition)
                     streaming = True
                     last_ts = time.monotonic()
-                    _set_asr_diag(streaming=True, started_at=time.time(), last_audio_at=None, audio_chunks=0, last_error="")
+                    _set_asr_diag(streaming=True, started_at=time.time(), last_audio_at=None, audio_chunks=0, last_error="", mic_muted=False)
                     keepalive_task = asyncio.create_task(keepalive_loop())
                     await ui_broadcast_partial("（已开始接收音频…）")
                     await ws.send_text("OK:STARTED")
@@ -1573,12 +1602,26 @@ async def ws_audio(ws: WebSocket):
             elif "bytes" in msg and msg["bytes"] is not None:
                 if streaming and recognition:
                     try:
-                        recognition.send_audio_frame(msg["bytes"])
+                        pcm = msg["bytes"]
+                        muted = bool(MUTE_MIC_DURING_PLAYBACK and is_output_playing())
+                        was_muted = bool(asr_diag.get("mic_muted"))
+                        if muted:
+                            pcm = bytes(len(pcm))
+                        if muted != was_muted:
+                            print(
+                                "[AUDIO] 播报中已暂停麦克风推送" if muted else "[AUDIO] 播报结束，恢复麦克风推送",
+                                flush=True,
+                            )
+                        recognition.send_audio_frame(pcm)
                         last_ts = time.monotonic()
                         chunks = int(asr_diag.get("audio_chunks") or 0) + 1
                         if chunks % 250 == 0:
                             print(f"[AUDIO] ASR received {chunks} chunks", flush=True)
-                        _set_asr_diag(audio_chunks=chunks, last_audio_at=time.time())
+                        _set_asr_diag(
+                            audio_chunks=chunks,
+                            last_audio_at=time.time(),
+                            mic_muted=muted,
+                        )
                     except Exception:
                         await on_sdk_error("send_audio_frame failed")
 

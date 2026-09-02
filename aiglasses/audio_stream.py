@@ -4,6 +4,7 @@ import asyncio
 import os
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 
@@ -33,6 +34,8 @@ _local_player_error = ""
 _local_pcm_queue: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=240)
 _local_player_thread: Optional[threading.Thread] = None
 _local_player_stop = threading.Event()
+_last_audible_output_at = 0.0
+MIC_MUTE_HANGOVER_SEC = max(0.0, float(os.getenv("AIGLASS_MIC_MUTE_HANGOVER_SEC", "0.8")))
 
 
 def normalize_playback_target(value: Optional[str]) -> str:
@@ -116,6 +119,7 @@ def _local_player_loop() -> None:
             continue
         if chunk is None:
             continue
+        _mark_audible_output(chunk)
         player = _ensure_local_player()
         if player is None:
             continue
@@ -187,6 +191,42 @@ async def cancel_current_ai():
 def is_playing_now() -> bool:
     task = current_ai_task
     return task is not None and not task.done()
+
+
+def _pcm_has_signal(piece: bytes) -> bool:
+    return bool(piece) and any(piece)
+
+
+def _mark_audible_output(piece: bytes) -> None:
+    global _last_audible_output_at
+    if _pcm_has_signal(piece):
+        _last_audible_output_at = time.time()
+
+
+def is_output_playing(hangover_sec: Optional[float] = None) -> bool:
+    """电脑喇叭或 /stream.wav 正在出声（含尾音保护窗口）。"""
+    hangover = MIC_MUTE_HANGOVER_SEC if hangover_sec is None else max(0.0, float(hangover_sec))
+    try:
+        if _local_pcm_queue.qsize() > 0:
+            return True
+    except Exception:
+        pass
+    for sc in list(stream_clients):
+        try:
+            if sc.q.qsize() > 0:
+                return True
+        except Exception:
+            pass
+    try:
+        from .audio_player import is_voice_playing
+
+        if is_voice_playing():
+            return True
+    except Exception:
+        pass
+    if _last_audible_output_at and (time.time() - _last_audible_output_at) < hangover:
+        return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -335,8 +375,6 @@ async def finish_pcm16_stream() -> None:
 
 
 def get_stream_status() -> Dict[str, Any]:
-    import time
-
     age = None if not last_broadcast_at else max(0.0, time.time() - last_broadcast_at)
     return {
         "clients": len(stream_clients),
@@ -346,6 +384,7 @@ def get_stream_status() -> Dict[str, Any]:
         "playback_target": _playback_target,
         "local_player_error": _local_player_error,
         "local_player_active": _playback_target == PLAYBACK_SERVER,
+        "output_playing": is_output_playing(),
     }
 
 
@@ -413,7 +452,9 @@ def register_stream_route(app):
                         break
                     if chunk is None:
                         continue
-                    yield chunk or STREAM_IDLE_SILENCE
+                    out = chunk or STREAM_IDLE_SILENCE
+                    _mark_audible_output(out)
+                    yield out
                     last_yield_at = asyncio.get_running_loop().time()
                     next_tick += 0.020
                     delay = next_tick - asyncio.get_running_loop().time()

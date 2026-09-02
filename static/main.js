@@ -22,6 +22,7 @@
   const $serverHostOptions = document.getElementById('serverHostOptions');
   const $dashscopeKeyInput = document.getElementById('dashscopeKeyInput');
   const $performanceProfileInput = document.getElementById('performanceProfileInput');
+  const $muteMicDuringPlaybackInput = document.getElementById('muteMicDuringPlaybackInput');
   const $blindPathModelInput = document.getElementById('blindPathModelInput');
   const $obstacleModelInput = document.getElementById('obstacleModelInput');
   const $itemModelInput = document.getElementById('itemModelInput');
@@ -323,6 +324,7 @@
       tone = 'err';
     }
     if (playing) text += '，正在播放';
+    if (data?.mic_muted) text += '，已静麦';
     setBadge($speakerStatus, tone === 'ok', text, tone);
   }
 
@@ -374,7 +376,11 @@
       : '，助手休眠';
     if (data.audio_connected && data.asr_streaming) {
       const chunks = Number(data.asr_audio_chunks || 0);
-      setBadge($audioStatusStage, wake.active, `麦克风：识别中（${chunks} 个音频块）${wakeSuffix}`, wake.active ? 'ok' : 'warn');
+      if (data.mic_muted) {
+        setBadge($audioStatusStage, false, `麦克风：播报中已暂停推送（${chunks} 个音频块）`, 'warn');
+      } else {
+        setBadge($audioStatusStage, wake.active, `麦克风：识别中（${chunks} 个音频块）${wakeSuffix}`, wake.active ? 'ok' : 'warn');
+      }
     } else if (data.audio_connected) {
       setBadge($audioStatusStage, wake.active, `麦克风：已连接，语音识别未启动${wakeSuffix}`, wake.active ? 'ok' : 'warn');
     } else {
@@ -627,6 +633,9 @@
       if ($performanceProfileInput) {
         $performanceProfileInput.value = cfg.performance_profile || 'balanced';
       }
+      if ($muteMicDuringPlaybackInput) {
+        $muteMicDuringPlaybackInput.checked = cfg.mute_mic_during_playback !== false;
+      }
       if ($blindPathModelInput) $blindPathModelInput.value = models.blind_path_model || '';
       if ($obstacleModelInput) $obstacleModelInput.value = models.obstacle_model || '';
       if ($itemModelInput) $itemModelInput.value = models.item_search_model || '';
@@ -641,6 +650,26 @@
     updateEndpointTexts(normalizeHostPort($serverHostInput.value));
   });
 
+  $muteMicDuringPlaybackInput?.addEventListener('change', async () => {
+    const enabled = Boolean($muteMicDuringPlaybackInput.checked);
+    try {
+      const res = await fetch('/api/runtime-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mute_mic_during_playback: enabled }),
+      });
+      if (!res.ok) throw new Error(String(res.status));
+      const data = await res.json();
+      if ($runtimeConfigStatus) {
+        $runtimeConfigStatus.textContent = data.mute_mic_during_playback
+          ? '已开启：播报时暂停麦克风推送'
+          : '已关闭：播报时仍推送麦克风';
+      }
+    } catch (e) {
+      if ($runtimeConfigStatus) $runtimeConfigStatus.textContent = '播报静麦开关保存失败';
+    }
+  });
+
   $btnSaveRuntime?.addEventListener('click', async () => {
     try {
       const key = $dashscopeKeyInput?.value?.trim() || '';
@@ -650,6 +679,7 @@
       const trafficlightModel = $trafficModelInput?.value?.trim() || '';
       const handTaskPath = $handTaskInput?.value?.trim() || '';
       const performanceProfile = $performanceProfileInput?.value || 'balanced';
+      const muteMicDuringPlayback = $muteMicDuringPlaybackInput ? $muteMicDuringPlaybackInput.checked : true;
       const res = await fetch('/api/runtime-config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -661,6 +691,7 @@
           trafficlight_model: trafficlightModel,
           hand_task_path: handTaskPath,
           performance_profile: performanceProfile,
+          mute_mic_during_playback: muteMicDuringPlayback,
         })
       });
       if (!res.ok) throw new Error(String(res.status));
@@ -668,9 +699,10 @@
       if ($dashscopeKeyInput) $dashscopeKeyInput.value = '';
       if ($runtimeConfigStatus) {
         const profileName = data?.performance_profile?.name_zh || '当前';
+        const muteLabel = data?.mute_mic_during_playback !== false ? '播报静麦开' : '播报静麦关';
         $runtimeConfigStatus.textContent = data.api_key_configured
-          ? `配置已保存，${profileName}档；API Key 已配置`
-          : `配置已保存，${profileName}档；API Key 未配置`;
+          ? `配置已保存，${profileName}档，${muteLabel}；API Key 已配置`
+          : `配置已保存，${profileName}档，${muteLabel}；API Key 未配置`;
       }
       updateEndpointTexts(normalizeHostPort($serverHostInput?.value));
     } catch (e) {
