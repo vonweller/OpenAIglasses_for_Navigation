@@ -1,5 +1,7 @@
 # CanMV K230 智能眼镜设备端
 
+换电脑、IP、Wi-Fi 或让新 AI 接手时，先读 [AI 开发交接文档](../../docs/AI_DEVELOPMENT_HANDOFF.md)，包含私有配置单文件更新、启动与回退流程。
+
 用 K230 替换 `compile/compile.ino` 的采集/播放设备层，继续使用现有 FastAPI 后端、模型、ASR 和网页。**不在 KPU 上重复部署后端模型，也不模拟不存在的 IMU。**
 
 ## 已适配硬件与边界

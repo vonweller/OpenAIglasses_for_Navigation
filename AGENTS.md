@@ -1,5 +1,7 @@
 # Repository Guidelines
 
+Start a handoff or environment/network change by reading [docs/AI_DEVELOPMENT_HANDOFF.md](docs/AI_DEVELOPMENT_HANDOFF.md). It covers IP/Wi-Fi/port migration, safe private-config updates, deployment/rollback, and unresolved cloud connection errors. Recheck actual runtime state; recorded IPs, COM ports, and running processes are not durable assumptions.
+
 ## Project Structure & Module Organization
 
 This is a voice-controlled assistive-glasses system for visually impaired users. The root `app_main.py` launches the FastAPI backend in `aiglasses/`; it is not the backend implementation. Navigation lives in `aiglasses/navigation_master.py`, `workflow_blindpath.py`, and `workflow_crossstreet.py`; ASR, vision, audio, and model clients remain backend responsibilities. Use `aiglasses/paths.py` for host-side paths. Browser assets are in `templates/` and `static/`.
