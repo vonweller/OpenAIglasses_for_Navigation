@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional, Set
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 
+from .playback_clock import PlaybackClock
+
 STREAM_SR = 8000
 STREAM_CH = 1
 STREAM_SW = 2
@@ -30,6 +32,7 @@ DEFAULT_PLAYBACK_TARGET = PLAYBACK_SERVER
 current_ai_task: Optional[asyncio.Task] = None
 _playback_target = DEFAULT_PLAYBACK_TARGET
 _local_player_lock = threading.Lock()
+_local_thread_lock = threading.Lock()
 _local_player = None
 _local_player_error = ""
 _local_pcm_queue: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=240)
@@ -168,6 +171,7 @@ def _ensure_local_player():
 
 
 def _local_player_loop() -> None:
+    global _local_written_bytes, _local_underruns
     while not _local_player_stop.is_set():
         try:
             chunk = _local_pcm_queue.get(timeout=0.2)
@@ -179,7 +183,9 @@ def _local_player_loop() -> None:
         if player is None:
             continue
         try:
-            player.write(chunk)
+            underflow = player.write(chunk)
+            _local_written_bytes += len(chunk)
+            _local_underruns += int(bool(underflow))
         except Exception as exc:
             print(f"[AUDIO] 本机播放失败: {exc}", flush=True)
             _close_local_player()
@@ -191,15 +197,16 @@ def _local_player_loop() -> None:
 
 def _ensure_local_player_thread() -> None:
     global _local_player_thread
-    if _local_player_thread is not None and _local_player_thread.is_alive():
-        return
-    _local_player_stop.clear()
-    _local_player_thread = threading.Thread(
-        target=_local_player_loop,
-        name="local-speaker",
-        daemon=True,
-    )
-    _local_player_thread.start()
+    with _local_thread_lock:
+        if _local_player_thread is not None and _local_player_thread.is_alive():
+            return
+        _local_player_stop.clear()
+        _local_player_thread = threading.Thread(
+            target=_local_player_loop,
+            name="local-speaker",
+            daemon=True,
+        )
+        _local_player_thread.start()
 
 
 def _enqueue_local_pcm(piece: bytes) -> None:
@@ -208,19 +215,9 @@ def _enqueue_local_pcm(piece: bytes) -> None:
     # 测试把 _local_player_autostart 设为 False，只入队、不打开声卡。
     if _local_player_autostart:
         _ensure_local_player_thread()
-    dropped = b""
-    try:
-        if _local_pcm_queue.full():
-            try:
-                dropped = _local_pcm_queue.get_nowait() or b""
-            except Exception:
-                dropped = b""
-        _local_pcm_queue.put_nowait(piece)
-    except Exception:
-        return
-    # 丢掉的最旧帧不再会响，不能留在预计结束时刻里。
-    if dropped:
-        _unschedule_local_play(dropped)
+    # Speech is ordered content, not a latest-video-frame buffer. A full queue
+    # must apply backpressure in the producer instead of removing the beginning.
+    _local_pcm_queue.put_nowait(piece)
     _schedule_local_play(piece)
 
 
@@ -239,6 +236,8 @@ def set_playback_target(value: Optional[str]) -> str:
     global _playback_target
     target = normalize_playback_target(value)
     previous = _playback_target
+    if previous != target:
+        _invalidate_pcm()
     _playback_target = target
     os.environ["AIGLASS_PLAYBACK_TARGET"] = target
     # both 与 server 都要本机喇叭。只有切到纯 device 才停本地线程。
@@ -367,6 +366,16 @@ last_broadcast_bytes: int = 0
 total_broadcast_bytes: int = 0
 _pcm_buffer_lock = threading.Lock()
 _pending_pcm16 = bytearray()
+_playback_clock = PlaybackClock(STREAM_SR * STREAM_SW, STREAM_START_BUFFER_CHUNKS * 0.02)
+_dispatch_lock = threading.Lock()
+_playback_epoch = 0
+_stream_loop: Optional[asyncio.AbstractEventLoop] = None
+_local_enqueued_bytes = 0
+_local_written_bytes = 0
+_device_enqueued_bytes = 0
+_cancelled_pcm_bytes = 0
+_device_stalls = 0
+_local_underruns = 0
 
 
 def _wav_header_unknown_size(sr=STREAM_SR, ch=STREAM_CH, sw=STREAM_SW) -> bytes:
@@ -405,8 +414,17 @@ def _flush_local_pcm() -> None:
     _last_audible_output_at = 0.0
 
 
-async def hard_reset_audio(reason: str = ""):
+def _invalidate_pcm() -> None:
+    global _playback_epoch
+    with _pcm_buffer_lock:
+        _playback_epoch += 1
+        _pending_pcm16.clear()
+        _playback_clock.reset()
     _flush_local_pcm()
+
+
+async def hard_reset_audio(reason: str = ""):
+    _invalidate_pcm()
     for sc in list(stream_clients):
         try:
             sc.abort_event.set()
@@ -423,7 +441,7 @@ async def hard_reset_audio(reason: str = ""):
 
 
 async def soft_reset_audio(reason: str = ""):
-    _flush_local_pcm()
+    _invalidate_pcm()
     await cancel_current_ai()
     with _pcm_buffer_lock:
         _pending_pcm16.clear()
@@ -443,27 +461,84 @@ async def soft_reset_audio(reason: str = ""):
 
 
 def _enqueue_pcm_piece(piece: bytes) -> None:
-    if not piece:
-        return
-    dead: List[StreamClient] = []
     for sc in list(stream_clients):
         if sc.abort_event.is_set():
-            dead.append(sc)
-            continue
-        try:
-            if sc.q.full():
-                try:
-                    sc.q.get_nowait()
-                except Exception:
-                    pass
+            stream_clients.discard(sc)
+        else:
             sc.q.put_nowait(piece)
-        except Exception:
-            dead.append(sc)
-    for sc in dead:
-        stream_clients.discard(sc)
+
+
+async def _on_stream_loop(coro):
+    loop = _stream_loop
+    if loop is None or loop.is_closed() or not loop.is_running() or loop is asyncio.get_running_loop():
+        return await coro
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    try:
+        return await asyncio.wrap_future(future)
+    except asyncio.CancelledError:
+        future.cancel()
+        raise
+
+
+async def _wait_for_playback_room(epoch: int) -> bool:
+    global _device_stalls
+    started = time.monotonic()
+    if _targets_server() and _local_player_autostart:
+        _ensure_local_player_thread()
+    while epoch == _playback_epoch:
+        local_full = _targets_server() and _local_pcm_queue.full()
+        full_clients = [sc for sc in list(stream_clients)
+                        if _targets_device() and not sc.abort_event.is_set() and sc.q.full()]
+        if not local_full and not full_clients:
+            return True
+        waited = time.monotonic() - started
+        if waited >= 1.0 and full_clients:
+            for sc in full_clients:
+                sc.abort_event.set()
+                stream_clients.discard(sc)
+                _device_stalls += 1
+        if local_full and waited >= 5.0:
+            raise TimeoutError("Computer audio output is not consuming PCM")
+        await asyncio.sleep(0.005)
+    return False
+
+
+async def _dispatch_pcm(ready: List[bytes], epoch: int) -> None:
+    global _local_enqueued_bytes, _device_enqueued_bytes, _cancelled_pcm_bytes
+    while not _dispatch_lock.acquire(blocking=False):
+        if epoch != _playback_epoch:
+            _cancelled_pcm_bytes += sum(map(len, ready))
+            return
+        await asyncio.sleep(0.005)
+    try:
+        for index, piece in enumerate(ready):
+            if epoch != _playback_epoch:
+                _cancelled_pcm_bytes += sum(map(len, ready[index:]))
+                return
+            dispatch_at = _playback_clock.reserve(len(piece))
+            while epoch == _playback_epoch:
+                delay = dispatch_at - _playback_clock.clock()
+                if delay <= 0:
+                    break
+                await asyncio.sleep(min(delay, 0.02))
+            if not await _wait_for_playback_room(epoch):
+                _cancelled_pcm_bytes += sum(map(len, ready[index:]))
+                return
+            if _targets_server():
+                _enqueue_local_pcm(piece)
+                _local_enqueued_bytes += len(piece)
+            if _targets_device():
+                _enqueue_pcm_piece(piece)
+                _device_enqueued_bytes += len(piece)
+    finally:
+        _dispatch_lock.release()
 
 
 async def broadcast_pcm16_realtime(pcm16: bytes):
+    await _on_stream_loop(_broadcast_pcm(pcm16))
+
+
+async def _broadcast_pcm(pcm16: bytes):
     global last_broadcast_at, last_broadcast_bytes, total_broadcast_bytes
     if pcm16:
         import time
@@ -483,33 +558,30 @@ async def broadcast_pcm16_realtime(pcm16: bytes):
     # of padding each fragment with silence, which caused audible dropouts.
     ready: List[bytes] = []
     with _pcm_buffer_lock:
+        epoch = _playback_epoch
         _pending_pcm16.extend(pcm16)
         while len(_pending_pcm16) >= BYTES_PER_20MS_16K:
             ready.append(bytes(_pending_pcm16[:BYTES_PER_20MS_16K]))
             del _pending_pcm16[:BYTES_PER_20MS_16K]
-    for piece in ready:
-        _fanout_pcm_piece(piece)
-
-
-def _fanout_pcm_piece(piece: bytes) -> None:
-    """同一 20ms 帧分别入队。字节计数在调用前已经按源 PCM 记过一次。"""
-    if not piece:
-        return
-    if _targets_server():
-        _enqueue_local_pcm(piece)
-    if _targets_device():
-        _enqueue_pcm_piece(piece)
+    await _dispatch_pcm(ready, epoch)
 
 
 async def finish_pcm16_stream() -> None:
     """Flush the final partial audio frame once at the end of a response."""
+    await _on_stream_loop(_finish_pcm())
+
+
+async def _finish_pcm() -> None:
     with _pcm_buffer_lock:
+        epoch = _playback_epoch
         piece = bytes(_pending_pcm16)
         _pending_pcm16.clear()
     if piece and len(piece) < BYTES_PER_20MS_16K:
         piece += b"\x00" * (BYTES_PER_20MS_16K - len(piece))
     if piece:
-        _fanout_pcm_piece(piece)
+        await _dispatch_pcm([piece], epoch)
+    if epoch != _playback_epoch:
+        return
     if _targets_device():
         for sc in list(stream_clients):
             if not sc.abort_event.is_set():
@@ -525,6 +597,13 @@ def get_stream_status() -> Dict[str, Any]:
         "total_broadcast_bytes": total_broadcast_bytes,
         "playback_target": _playback_target,
         "local_player_error": _local_player_error,
+        "local_enqueued_bytes": _local_enqueued_bytes,
+        "local_written_bytes": _local_written_bytes,
+        "device_enqueued_bytes": _device_enqueued_bytes,
+        "cancelled_pcm_bytes": _cancelled_pcm_bytes,
+        "device_stalls": _device_stalls,
+        "local_underruns": _local_underruns,
+        "dispatch_ahead_sec": round(max(0.0, _playback_clock.end_at - _playback_clock.clock()), 3),
         "local_player_active": _targets_server(),
         "output_playing": is_output_playing(),
     }
@@ -533,6 +612,16 @@ def get_stream_status() -> Dict[str, Any]:
 
 
 def register_stream_route(app):
+    @app.on_event("startup")
+    async def bind_stream_loop():
+        global _stream_loop
+        _stream_loop = asyncio.get_running_loop()
+
+    @app.on_event("shutdown")
+    async def unbind_stream_loop():
+        global _stream_loop
+        _stream_loop = None
+
     @app.get("/stream.wav")
     async def stream_wav(_: Request):
         for sc in list(stream_clients):
