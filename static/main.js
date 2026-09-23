@@ -22,6 +22,7 @@
   const $serverHostOptions = document.getElementById('serverHostOptions');
   const $dashscopeKeyInput = document.getElementById('dashscopeKeyInput');
   const $performanceProfileInput = document.getElementById('performanceProfileInput');
+  const $playbackTargetInput = document.getElementById('playbackTargetInput');
   const $muteMicDuringPlaybackInput = document.getElementById('muteMicDuringPlaybackInput');
   const $blindPathModelInput = document.getElementById('blindPathModelInput');
   const $obstacleModelInput = document.getElementById('obstacleModelInput');
@@ -317,10 +318,13 @@
     const age = stream.last_broadcast_age_sec;
     const playing = age !== null && age !== undefined && Number.isFinite(Number(age)) && Number(age) < 3;
     const localErr = String(stream.local_player_error || '').trim();
-    let text = '音频播放：服务端电脑';
+    const target = data?.playback_target || stream.playback_target || 'server';
+    const targetLabel = target === 'both' ? '电脑和设备' : (target === 'esp32' ? '仅设备' : '服务端电脑');
+    let text = `音频播放：${targetLabel}`;
+    if ($playbackTargetInput && document.activeElement !== $playbackTargetInput) $playbackTargetInput.value = target;
     let tone = 'ok';
-    if (localErr) {
-      text = '音频播放：服务端电脑（失败）';
+    if (localErr && target !== 'esp32') {
+      text = `音频播放：${targetLabel}（电脑输出失败）`;
       tone = 'err';
     }
     if (playing) text += '，正在播放';
@@ -348,6 +352,15 @@
     if ($latencyMs) $latencyMs.textContent = `${Number(p.latency_ms || 0).toFixed(0)} 毫秒`;
     if ($outputDrops) $outputDrops.textContent = `${Number(p.output_dropped || 0)} / 浏览器 ${localDecodeDrops}`;
     const esp = p.esp32_camera || {};
+    const deviceType = String(data?.device_type || esp.device || '').toLowerCase();
+    if ($stageEmpty) {
+      const waiting = $stageEmpty.querySelector('span');
+      if (waiting) {
+        waiting.textContent = deviceType === 'k230'
+          ? '后端已运行，K230 摄像头尚未接入'
+          : '后端已运行，ESP32 摄像头尚未接入';
+      }
+    }
     const rssi = esp.rssi ?? esp.wifi_rssi;
     const heap = esp.free_heap ?? esp.heap_free;
     const pieces = [];
@@ -365,9 +378,10 @@
       if (!lastFrameAt || Date.now() - lastFrameAt > 1500) {
         if ($stageEmpty) $stageEmpty.classList.remove('is-hidden');
         if ($fps) $fps.textContent = '显示帧率：--';
-        fitCanvas();
-        ctx.fillStyle = '#020509';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        if (canvas.width > 0 && canvas.height > 0) {
+          ctx.fillStyle = '#020509';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+        }
       }
     }
     const wake = data?.wake || {};
@@ -414,15 +428,15 @@
     return { label, text: `${label} ${t}` };
   }
 
-  function fitCanvas(){
-    const rect = canvas.getBoundingClientRect();
-    const w = Math.max(320, Math.floor(rect.width));
-    const h = Math.max(240, Math.floor(rect.height || rect.width * 3/4));
-    if (canvas.width !== w || canvas.height !== h) {
-      canvas.width = w; canvas.height = h;
+  function fitCanvas(sourceWidth, sourceHeight){
+    const iw = Math.max(1, Math.round(Number(sourceWidth) || 0));
+    const ih = Math.max(1, Math.round(Number(sourceHeight) || 0));
+    if (iw > 1 && ih > 1 && (canvas.width !== iw || canvas.height !== ih)) {
+      canvas.width = iw;
+      canvas.height = ih;
     }
   }
-  window.addEventListener('resize', fitCanvas); fitCanvas();
+  window.addEventListener('resize', () => fitCanvas(canvas.width, canvas.height));
 
   let wsCam, wsUI, frames = 0, fpsTimer = 0, lastFrameAt = 0;
   let pendingFrame = null;
@@ -436,7 +450,8 @@
     const now = performance.now();
     if (!fpsTimer) fpsTimer = now;
     if (now - fpsTimer >= 1000){
-      const displayFps = frames * 1000 / (now - fpsTimer);
+      const elapsed = now - fpsTimer;
+      const displayFps = frames * 1000 / elapsed;
       if ($fps) $fps.textContent = `显示帧率：${displayFps.toFixed(1)} 帧/秒`;
       frames = 0;
       fpsTimer = now;
@@ -472,26 +487,11 @@
           drawable = 'createImageBitmap' in window
             ? await createImageBitmap(blob)
             : await decodeImageElement(blob);
-          if (pendingFrame) {
-            localDecodeDrops++;
-            if (drawable?.close) drawable.close();
-            continue;
-          }
-          fitCanvas();
-          const cw = canvas.width;
-          const ch = canvas.height;
-          const iw = drawable.width || 1;
-          const ih = drawable.height || 1;
-          const scale = Math.min(cw / iw, ch / ih);
-          const dw = Math.max(1, Math.round(iw * scale));
-          const dh = Math.max(1, Math.round(ih * scale));
-          const dx = Math.floor((cw - dw) / 2);
-          const dy = Math.floor((ch - dh) / 2);
-          ctx.fillStyle = '#05080d';
-          ctx.fillRect(0, 0, cw, ch);
-          ctx.imageSmoothingEnabled = scale < 1;
-          ctx.imageSmoothingQuality = 'high';
-          ctx.drawImage(drawable, dx, dy, dw, dh);
+          const iw = drawable.width || drawable.naturalWidth || 1;
+          const ih = drawable.height || drawable.naturalHeight || 1;
+          fitCanvas(iw, ih);
+          ctx.imageSmoothingEnabled = false;
+          ctx.drawImage(drawable, 0, 0, iw, ih);
           markFrameDrawn();
         } catch (e) {
           localDecodeDrops++;
@@ -631,7 +631,16 @@
       }
       const models = cfg.models || {};
       if ($performanceProfileInput) {
-        $performanceProfileInput.value = cfg.performance_profile || 'balanced';
+        const profileKey = cfg.performance_profile || 'balanced';
+        if ([...$performanceProfileInput.options].some((option) => option.value === profileKey)) {
+          $performanceProfileInput.value = profileKey;
+        }
+      }
+      if ($playbackTargetInput) {
+        const playback = cfg.playback_target || 'server';
+        if ([...$playbackTargetInput.options].some((option) => option.value === playback)) {
+          $playbackTargetInput.value = playback;
+        }
       }
       if ($muteMicDuringPlaybackInput) {
         $muteMicDuringPlaybackInput.checked = cfg.mute_mic_during_playback !== false;
@@ -679,6 +688,7 @@
       const trafficlightModel = $trafficModelInput?.value?.trim() || '';
       const handTaskPath = $handTaskInput?.value?.trim() || '';
       const performanceProfile = $performanceProfileInput?.value || 'balanced';
+      const playbackTarget = $playbackTargetInput?.value || 'server';
       const muteMicDuringPlayback = $muteMicDuringPlaybackInput ? $muteMicDuringPlaybackInput.checked : true;
       const res = await fetch('/api/runtime-config', {
         method: 'POST',
@@ -691,6 +701,7 @@
           trafficlight_model: trafficlightModel,
           hand_task_path: handTaskPath,
           performance_profile: performanceProfile,
+          playback_target: playbackTarget,
           mute_mic_during_playback: muteMicDuringPlayback,
         })
       });

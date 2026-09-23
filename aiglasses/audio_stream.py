@@ -24,6 +24,7 @@ STREAM_KEEPALIVE_SEC = max(1.0, float(os.getenv("AIGLASS_STREAM_KEEPALIVE_SEC", 
 
 PLAYBACK_SERVER = "server"
 PLAYBACK_ESP32 = "esp32"
+PLAYBACK_BOTH = "both"
 DEFAULT_PLAYBACK_TARGET = PLAYBACK_SERVER
 
 current_ai_task: Optional[asyncio.Task] = None
@@ -34,19 +35,73 @@ _local_player_error = ""
 _local_pcm_queue: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=240)
 _local_player_thread: Optional[threading.Thread] = None
 _local_player_stop = threading.Event()
+_local_player_autostart = True
 _last_audible_output_at = 0.0
-MIC_MUTE_HANGOVER_SEC = max(0.0, float(os.getenv("AIGLASS_MIC_MUTE_HANGOVER_SEC", "0.8")))
+# 本地喇叭按 20ms 节拍播放。入队时按字节预估结束时刻，避免把「队列非空」
+# 当成整段仍在响，也避免 server+device 两路把同一段 PCM 的时长加两次。
+_local_play_until = 0.0
+_local_play_lock = threading.Lock()
+MIC_MUTE_HANGOVER_SEC = max(0.0, float(os.getenv("AIGLASS_MIC_MUTE_HANGOVER_SEC", "0.35")))
 
 
 def normalize_playback_target(value: Optional[str]) -> str:
     raw = str(value or "").strip().lower()
-    if raw in ("esp32", "device", "glasses", "speaker", "xiao"):
+    if raw in ("both", "all", "dual"):
+        return PLAYBACK_BOTH
+    if raw in ("esp32", "device", "glasses", "speaker", "xiao", "k230"):
         return PLAYBACK_ESP32
     return PLAYBACK_SERVER
 
 
 def get_playback_target() -> str:
     return _playback_target
+
+
+def _targets_server(target: Optional[str] = None) -> bool:
+    chosen = _playback_target if target is None else target
+    return chosen in (PLAYBACK_SERVER, PLAYBACK_BOTH)
+
+
+def _targets_device(target: Optional[str] = None) -> bool:
+    chosen = _playback_target if target is None else target
+    return chosen in (PLAYBACK_ESP32, PLAYBACK_BOTH)
+
+
+def _pcm_duration_sec(piece: bytes) -> float:
+    """8 kHz mono PCM16 的播放时长。空或非偶数字节不计。"""
+    if not piece:
+        return 0.0
+    samples = len(piece) // STREAM_SW
+    if samples <= 0:
+        return 0.0
+    return samples / float(STREAM_SR)
+
+
+def _schedule_local_play(piece: bytes) -> None:
+    """把本机队列里新增的 PCM 接到当前预计结束时刻之后。
+
+    只累加本机这一路。device 队列是同一批样本的另一份拷贝，不能再加一次。
+    """
+    global _local_play_until
+    duration = _pcm_duration_sec(piece)
+    if duration <= 0.0 or not _pcm_has_signal(piece):
+        return
+    now = time.monotonic()
+    with _local_play_lock:
+        start = _local_play_until if _local_play_until > now else now
+        _local_play_until = start + duration
+
+
+def _clear_local_play_schedule() -> None:
+    global _local_play_until
+    with _local_play_lock:
+        _local_play_until = 0.0
+
+
+def local_play_remaining_sec() -> float:
+    with _local_play_lock:
+        until = _local_play_until
+    return max(0.0, until - time.monotonic())
 
 
 def _stop_local_player_thread() -> None:
@@ -65,6 +120,7 @@ def _stop_local_player_thread() -> None:
             _local_pcm_queue.get_nowait()
         except queue.Empty:
             break
+    _clear_local_play_schedule()
 
 
 def _close_local_player() -> None:
@@ -119,7 +175,6 @@ def _local_player_loop() -> None:
             continue
         if chunk is None:
             continue
-        _mark_audible_output(chunk)
         player = _ensure_local_player()
         if player is None:
             continue
@@ -128,6 +183,10 @@ def _local_player_loop() -> None:
         except Exception as exc:
             print(f"[AUDIO] 本机播放失败: {exc}", flush=True)
             _close_local_player()
+            continue
+        # 入队时已经把这段时长算进 _local_play_until。这里只给真实写出的
+        # 非零样本打尾音点，静音垫片和未写出的排队数据都不打。
+        _mark_audible_output(chunk)
 
 
 def _ensure_local_player_thread() -> None:
@@ -144,18 +203,36 @@ def _ensure_local_player_thread() -> None:
 
 
 def _enqueue_local_pcm(piece: bytes) -> None:
-    if not piece or _playback_target != PLAYBACK_SERVER:
+    if not piece or not _targets_server():
         return
-    _ensure_local_player_thread()
+    # 测试把 _local_player_autostart 设为 False，只入队、不打开声卡。
+    if _local_player_autostart:
+        _ensure_local_player_thread()
+    dropped = b""
     try:
         if _local_pcm_queue.full():
             try:
-                _local_pcm_queue.get_nowait()
+                dropped = _local_pcm_queue.get_nowait() or b""
             except Exception:
-                pass
+                dropped = b""
         _local_pcm_queue.put_nowait(piece)
     except Exception:
-        pass
+        return
+    # 丢掉的最旧帧不再会响，不能留在预计结束时刻里。
+    if dropped:
+        _unschedule_local_play(dropped)
+    _schedule_local_play(piece)
+
+
+def _unschedule_local_play(piece: bytes) -> None:
+    """队列溢出丢掉的帧不再占用本机播放时间。"""
+    global _local_play_until
+    duration = _pcm_duration_sec(piece)
+    if duration <= 0.0:
+        return
+    now = time.monotonic()
+    with _local_play_lock:
+        _local_play_until = max(now, _local_play_until - duration)
 
 
 def set_playback_target(value: Optional[str]) -> str:
@@ -164,10 +241,11 @@ def set_playback_target(value: Optional[str]) -> str:
     previous = _playback_target
     _playback_target = target
     os.environ["AIGLASS_PLAYBACK_TARGET"] = target
-    if target != PLAYBACK_SERVER:
+    # both 与 server 都要本机喇叭。只有切到纯 device 才停本地线程。
+    if not _targets_server(target):
         _stop_local_player_thread()
         _close_local_player()
-    elif previous != PLAYBACK_SERVER:
+    elif _local_player_autostart and not _targets_server(previous):
         _ensure_local_player_thread()
     if previous != target:
         print(f"[AUDIO] playback target -> {target}", flush=True)
@@ -204,19 +282,18 @@ def _mark_audible_output(piece: bytes) -> None:
 
 
 def is_output_playing(hangover_sec: Optional[float] = None) -> bool:
-    """电脑喇叭或 /stream.wav 正在出声（含尾音保护窗口）。"""
+    """电脑喇叭或 /stream.wav 正在出真实声音（含短尾音）。
+
+    全零保活、空队列、以及已经播完的排队字节都不算在播。
+    K230 放在电脑旁时两只喇叭都会回灌，所以 server 与 device 都计入。
+    本地一路用预计结束时刻，不用「队列非空」；device 一路只把含非零样本的
+    排队字节算进剩余时长，两路不把同一段 PCM 的时长加两次。
+    """
     hangover = MIC_MUTE_HANGOVER_SEC if hangover_sec is None else max(0.0, float(hangover_sec))
-    try:
-        if _local_pcm_queue.qsize() > 0:
-            return True
-    except Exception:
-        pass
-    for sc in list(stream_clients):
-        try:
-            if sc.q.qsize() > 0:
-                return True
-        except Exception:
-            pass
+    if local_play_remaining_sec() > 0.0:
+        return True
+    if _device_queued_audible_sec() > 0.0:
+        return True
     try:
         from .audio_player import is_voice_playing
 
@@ -227,6 +304,54 @@ def is_output_playing(hangover_sec: Optional[float] = None) -> bool:
     if _last_audible_output_at and (time.time() - _last_audible_output_at) < hangover:
         return True
     return False
+
+
+def _device_queued_audible_sec() -> float:
+    """尚未写进 /stream.wav 的非零 PCM 时长。全零保活帧不计。"""
+    total = 0.0
+    for sc in list(stream_clients):
+        try:
+            pending = list(sc.q._queue)
+        except Exception:
+            continue
+        for piece in pending:
+            if piece and _pcm_has_signal(piece):
+                total += _pcm_duration_sec(piece)
+    return total
+
+
+def playback_timing() -> Dict[str, Any]:
+    """给状态接口和测试用的时间/队列统计。时长只计本机预计值与设备有声排队。"""
+    local_queued = 0
+    try:
+        local_queued = _local_pcm_queue.qsize()
+    except Exception:
+        local_queued = 0
+    device_queued = 0
+    device_audible_sec = 0.0
+    for sc in list(stream_clients):
+        try:
+            pending = list(sc.q._queue)
+        except Exception:
+            continue
+        device_queued += len(pending)
+        for piece in pending:
+            if piece and _pcm_has_signal(piece):
+                device_audible_sec += _pcm_duration_sec(piece)
+    return {
+        "playback_target": _playback_target,
+        "local_queued_chunks": local_queued,
+        "local_remaining_sec": round(local_play_remaining_sec(), 4),
+        "device_queued_chunks": device_queued,
+        "device_audible_sec": round(device_audible_sec, 4),
+        "last_audible_age_sec": (
+            None
+            if not _last_audible_output_at
+            else round(max(0.0, time.time() - _last_audible_output_at), 4)
+        ),
+        "mic_mute_hangover_sec": MIC_MUTE_HANGOVER_SEC,
+        "output_playing": is_output_playing(),
+    }
 
 
 @dataclass(frozen=True)
@@ -269,7 +394,19 @@ def _wav_header_unknown_size(sr=STREAM_SR, ch=STREAM_CH, sw=STREAM_SW) -> bytes:
     )
 
 
+def _flush_local_pcm() -> None:
+    global _last_audible_output_at
+    while True:
+        try:
+            _local_pcm_queue.get_nowait()
+        except queue.Empty:
+            break
+    _clear_local_play_schedule()
+    _last_audible_output_at = 0.0
+
+
 async def hard_reset_audio(reason: str = ""):
+    _flush_local_pcm()
     for sc in list(stream_clients):
         try:
             sc.abort_event.set()
@@ -286,6 +423,7 @@ async def hard_reset_audio(reason: str = ""):
 
 
 async def soft_reset_audio(reason: str = ""):
+    _flush_local_pcm()
     await cancel_current_ai()
     with _pcm_buffer_lock:
         _pending_pcm16.clear()
@@ -350,10 +488,17 @@ async def broadcast_pcm16_realtime(pcm16: bytes):
             ready.append(bytes(_pending_pcm16[:BYTES_PER_20MS_16K]))
             del _pending_pcm16[:BYTES_PER_20MS_16K]
     for piece in ready:
-        if _playback_target == PLAYBACK_SERVER:
-            _enqueue_local_pcm(piece)
-        else:
-            _enqueue_pcm_piece(piece)
+        _fanout_pcm_piece(piece)
+
+
+def _fanout_pcm_piece(piece: bytes) -> None:
+    """同一 20ms 帧分别入队。字节计数在调用前已经按源 PCM 记过一次。"""
+    if not piece:
+        return
+    if _targets_server():
+        _enqueue_local_pcm(piece)
+    if _targets_device():
+        _enqueue_pcm_piece(piece)
 
 
 async def finish_pcm16_stream() -> None:
@@ -364,11 +509,8 @@ async def finish_pcm16_stream() -> None:
     if piece and len(piece) < BYTES_PER_20MS_16K:
         piece += b"\x00" * (BYTES_PER_20MS_16K - len(piece))
     if piece:
-        if _playback_target == PLAYBACK_SERVER:
-            _enqueue_local_pcm(piece)
-        else:
-            _enqueue_pcm_piece(piece)
-    if _playback_target != PLAYBACK_SERVER:
+        _fanout_pcm_piece(piece)
+    if _targets_device():
         for sc in list(stream_clients):
             if not sc.abort_event.is_set():
                 sc.flush_event.set()
@@ -376,16 +518,18 @@ async def finish_pcm16_stream() -> None:
 
 def get_stream_status() -> Dict[str, Any]:
     age = None if not last_broadcast_at else max(0.0, time.time() - last_broadcast_at)
-    return {
+    status = {
         "clients": len(stream_clients),
         "last_broadcast_age_sec": age,
         "last_broadcast_bytes": last_broadcast_bytes,
         "total_broadcast_bytes": total_broadcast_bytes,
         "playback_target": _playback_target,
         "local_player_error": _local_player_error,
-        "local_player_active": _playback_target == PLAYBACK_SERVER,
+        "local_player_active": _targets_server(),
         "output_playing": is_output_playing(),
     }
+    status.update(playback_timing())
+    return status
 
 
 def register_stream_route(app):
@@ -453,7 +597,10 @@ def register_stream_route(app):
                     if chunk is None:
                         continue
                     out = chunk or STREAM_IDLE_SILENCE
-                    _mark_audible_output(out)
+                    # _mark_audible_output 只认非零样本。全零保活不能打点，
+                    # 否则会把麦克风静音窗口无声地续上。
+                    if _pcm_has_signal(out):
+                        _mark_audible_output(out)
                     yield out
                     last_yield_at = asyncio.get_running_loop().time()
                     next_tick += 0.020

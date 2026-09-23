@@ -7,6 +7,8 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from .performance import overlay_jpeg_quality_for
+
 # 原始JPEG帧缓冲（只保留最新 N 帧）
 _MAX_BUF = 1
 _frames = deque(maxlen=_MAX_BUF)
@@ -131,13 +133,15 @@ def wait_raw_bgr(timeout_sec: float = 0.5):
     _consumer_state.last_seq = packet.seq
     return packet.bgr
 
-def send_vis_bgr(bgr, quality: int = 88):
-    """被 YOLO/MediaPipe 脚本调用：把处理后画面推给前端 viewer"""
+def send_vis_bgr(bgr, quality: int | None = None, profile_key: str | None = None):
+    """Encode an annotated BGR frame. Raw capture JPEG is not passed through this function."""
     if bgr is None:
         return
-    
-    # 直接编码，不做任何增强处理
-    ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    if quality is None:
+        quality = overlay_jpeg_quality_for(profile_key)
+    quality = max(1, min(100, int(quality)))
+
+    ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
     if not ok:
         return
     with _sender_lock:

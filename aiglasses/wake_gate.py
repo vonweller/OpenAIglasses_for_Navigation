@@ -68,11 +68,19 @@ def is_wake_phrase(text: str) -> bool:
     return any(w in norm for w in _wake_words())
 
 
+def is_sleep_command(text: str) -> bool:
+    """Only explicit assistant sleep commands; not questions about phone sleep."""
+    norm = _normalize(text)
+    return norm in ("休眠", "进入休眠", "进入休眠模式", "助手休眠", "请休眠", "停止对话", "退出对话")
+
+
 def is_always_on_command(text: str) -> bool:
     """功能指令在休眠时也应直接执行，不要求先说唤醒词。"""
     raw = str(text or "").strip()
     if not raw:
         return False
+    if is_sleep_command(raw):
+        return True
     if any(k in raw for k in ALWAYS_ON_KEYWORDS):
         return True
     return bool(_FIND_RE.search(raw))

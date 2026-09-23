@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+k230_secrets.py
 
 # Python caches and virtual environments
 __pycache__/

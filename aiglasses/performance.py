@@ -10,6 +10,10 @@ from dataclasses import asdict, dataclass
 from typing import Dict
 
 
+DEFAULT_PREVIEW_FPS = 30
+DEFAULT_OVERLAY_JPEG_QUALITY = 92
+
+
 @dataclass(frozen=True)
 class PerformanceProfile:
     key: str
@@ -21,12 +25,33 @@ class PerformanceProfile:
     jpeg_quality: int
     yolo_imgsz: int
     inference_hz: float
+    preview_fps: int = DEFAULT_PREVIEW_FPS
+    overlay_jpeg_quality: int = DEFAULT_OVERLAY_JPEG_QUALITY
+    device_family: str = "esp32"
 
 
 PROFILES: Dict[str, PerformanceProfile] = {
     "smooth": PerformanceProfile("smooth", "流畅", "VGA", 640, 480, 24, 14, 384, 12.0),
     "balanced": PerformanceProfile("balanced", "平衡", "VGA", 640, 480, 20, 12, 512, 10.0),
     "quality": PerformanceProfile("quality", "清晰", "SVGA", 800, 600, 15, 10, 640, 7.5),
+    # K230 names are protocol tokens. Board firmware must recognize them before use.
+    # jpeg_quality stays on the ESP scale (lower is sharper). 24 -> board encoder 76.
+    "k230_hd": PerformanceProfile(
+        "k230_hd", "K230 720p", "K230_HD", 1280, 720, 30, 24, 640, 8.0,
+        preview_fps=30, device_family="k230",
+    ),
+    "k230_1k": PerformanceProfile(
+        "k230_1k", "K230 1K", "K230_1K", 1280, 960, 25, 24, 640, 8.0,
+        preview_fps=25, device_family="k230",
+    ),
+    "k230_1_5k": PerformanceProfile(
+        "k230_1_5k", "K230 1.5K", "K230_1_5K", 1536, 864, 25, 24, 640, 6.0,
+        preview_fps=25, device_family="k230",
+    ),
+    "k230_fhd": PerformanceProfile(
+        "k230_fhd", "K230 1080p", "K230_FHD", 1920, 1080, 20, 26, 640, 5.0,
+        preview_fps=20, device_family="k230",
+    ),
 }
 DEFAULT_PROFILE = "balanced"
 
@@ -41,7 +66,23 @@ def profile_from_env() -> PerformanceProfile:
 
 
 def profile_payload(value: str) -> dict:
-    return asdict(PROFILES[normalize_profile(value)])
+    profile = PROFILES[normalize_profile(value)]
+    payload = asdict(profile)
+    payload["preview_fps"] = int(profile.preview_fps or profile.camera_fps or DEFAULT_PREVIEW_FPS)
+    return payload
+
+
+def preview_fps_for(value: str) -> int:
+    """Display cadence. Independent from inference_hz; falls back to camera_fps."""
+    profile = PROFILES[normalize_profile(value)]
+    fps = int(profile.preview_fps or profile.camera_fps or DEFAULT_PREVIEW_FPS)
+    return max(1, fps)
+
+
+def overlay_jpeg_quality_for(value: str) -> int:
+    """OpenCV quality for annotated frames only. Raw capture bytes stay untouched."""
+    profile = PROFILES[normalize_profile(value)]
+    return max(1, min(100, int(profile.overlay_jpeg_quality)))
 
 
 class RateMeter:

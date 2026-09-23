@@ -166,6 +166,8 @@ from .audio_player import initialize_audio_system, play_voice_text
 PLAYBACK_TARGET = set_playback_target(os.getenv("AIGLASS_PLAYBACK_TARGET", PLAYBACK_TARGET))
 
 from . import wake_gate
+from .audio_ingress import OrderedAudioSender, PcmFramer
+from .asr_transport import QueuedRecognition
 
 # ---- 同步录制器 ----
 from . import sync_recorder
@@ -189,16 +191,20 @@ RECENT_MAX = 50
 last_frames: Deque[Tuple[float, bytes]] = deque(maxlen=10)
 
 camera_viewers: Set[WebSocket] = set()
+_viewer_queues: Dict[WebSocket, asyncio.Queue] = {}
 esp32_camera_ws: Optional[WebSocket] = None
 imu_ws_clients: Set[WebSocket] = set()
 esp32_audio_ws: Optional[WebSocket] = None
 camera_stats: Dict[str, Any] = {}
+camera_device_type = "esp32"
 _latest_output_lock = threading.Lock()
 _latest_output_frame: Optional[bytes] = None
 _latest_output_version = 0
 _last_processed_output_at = 0.0
 _output_event: Optional[asyncio.Event] = None
 _viewer_broadcast_task: Optional[asyncio.Task] = None
+_viewer_send_ms = 0.0
+_viewer_loop_ms = 0.0
 _visual_worker_stop = threading.Event()
 _visual_worker_thread: Optional[threading.Thread] = None
 current_item_target_zh = ""
@@ -275,7 +281,7 @@ def _offer_viewer_frame(jpeg_bytes: bytes, processed: bool = False) -> None:
     now_mono = time.monotonic()
     if not processed and _last_processed_output_at > 0:
         # 推理结果刚输出时短暂保留叠加画面，避免原始帧立即覆盖中文状态和框选。
-        hold_sec = max(0.045, min(0.12, 0.65 / max(1.0, PROFILES[PERFORMANCE_PROFILE].inference_hz)))
+        hold_sec = min(0.05, 1.0 / max(1.0, PROFILES[PERFORMANCE_PROFILE].preview_fps))
         if now_mono - _last_processed_output_at < hold_sec:
             return
     with _latest_output_lock:
@@ -291,6 +297,7 @@ def _offer_viewer_frame(jpeg_bytes: bytes, processed: bool = False) -> None:
 
 async def _viewer_broadcast_loop() -> None:
     """Broadcast the newest JPEG; slow clients never create a frame backlog."""
+    global _viewer_send_ms, _viewer_loop_ms
     seen_version = 0
     last_sent_at = 0.0
     while True:
@@ -299,7 +306,10 @@ async def _viewer_broadcast_loop() -> None:
             continue
         await _output_event.wait()
         _output_event.clear()
-        min_interval = 1.0 / max(1.0, float(PROFILES[PERFORMANCE_PROFILE].camera_fps))
+        preview_fps = PROFILES[PERFORMANCE_PROFILE].preview_fps
+        # Windows selector sleep can round to 15.6 ms; do not re-throttle an
+        # already paced camera stream at the same rate and discard every other frame.
+        min_interval = 1.0 / max(60.0, float(preview_fps))
         delay = min_interval - (time.monotonic() - last_sent_at)
         if delay > 0:
             await asyncio.sleep(delay)
@@ -310,21 +320,16 @@ async def _viewer_broadcast_loop() -> None:
             continue
         seen_version = version
 
-        async def _send_one(ws: WebSocket):
-            try:
-                await asyncio.wait_for(ws.send_bytes(jpeg_bytes), timeout=0.35)
-                return None
-            except Exception:
-                return ws
-
-        clients = list(camera_viewers)
-        if clients:
-            dead = await asyncio.gather(*(_send_one(ws) for ws in clients))
-            for ws in dead:
-                if ws is not None:
-                    camera_viewers.discard(ws)
+        send_started = time.monotonic()
+        _viewer_loop_ms = (send_started - last_sent_at) * 1000 if last_sent_at else 0.0
+        last_sent_at = send_started
+        for queue_ in list(_viewer_queues.values()):
+            if queue_.full():
+                queue_.get_nowait()
+            queue_.put_nowait(jpeg_bytes)
+        _viewer_send_ms = (time.monotonic() - send_started) * 1000
+        if _viewer_queues:
             pipeline_metrics.on_broadcast()
-            last_sent_at = time.monotonic()
 
 
 async def _send_ui_message(ws: WebSocket, message: str) -> None:
@@ -413,7 +418,7 @@ def _visual_worker() -> None:
             frame_age_ms=max(0.0, (time.time() - packet.captured_at) * 1000.0),
             last_error="",
         )
-        bridge_io.send_vis_bgr(out_img if out_img is not None else packet.bgr, quality=88)
+        bridge_io.send_vis_bgr(out_img if out_img is not None else packet.bgr, profile_key=PERFORMANCE_PROFILE)
         if guidance_text:
             try:
                 play_voice_text(guidance_text)
@@ -444,6 +449,8 @@ def _persist_runtime_config(models: Optional[dict] = None) -> None:
 
 async def _send_camera_profile(ws: WebSocket) -> None:
     profile = PROFILES[PERFORMANCE_PROFILE]
+    if profile.device_family == "k230" and camera_device_type != "k230":
+        profile = PROFILES["balanced"]
     for command in (
         f"SET:FRAMESIZE={profile.framesize}",
         f"SET:QUALITY={profile.jpeg_quality}",
@@ -788,6 +795,15 @@ async def start_ai_with_text_custom(user_text: str):
     """扩展版的AI启动函数，支持识别特殊命令"""
     global navigation_active, blind_path_navigator, cross_street_active, cross_street_navigator, orchestrator
 
+    if wake_gate.is_sleep_command(user_text):
+        await soft_reset_audio("explicit sleep command")
+        stop_yolomedia()
+        if orchestrator:
+            orchestrator.stop_navigation()
+        wake_gate.deactivate()
+        await ui_broadcast_final("[系统] 已进入休眠，说“你好智能助手”唤醒")
+        return
+
     if "找到了" in user_text or "拿到了" in user_text or "收到" in user_text:
         print("[ITEM_SEARCH] Found/received command detected", flush=True)
         stop_yolomedia()
@@ -1088,8 +1104,15 @@ def _device_status_payload() -> dict:
         yolo_status["target_zh"] = current_item_target_zh
     return {
         "camera_connected": _ws_connected(esp32_camera_ws),
+        "device_type": camera_device_type,
+        "audio_input": {key: asr_diag.get(key) for key in (
+            "input_rms", "input_dbfs", "input_peak", "input_dc", "max_packet_gap_ms",
+            "asr_dropped_frames", "asr_queue_frames", "keepalive_frames", "muted_frames",
+        )},
         "audio_connected": _ws_connected(esp32_audio_ws),
         "viewer_count": len(camera_viewers),
+        "viewer_send_ms": round(_viewer_send_ms, 1),
+        "viewer_loop_ms": round(_viewer_loop_ms, 1),
         "imu_viewer_count": len(imu_ws_clients),
         "last_frame_age_sec": last_frame_age,
         "asr_streaming": bool(asr_diag.get("streaming")),
@@ -1131,6 +1154,11 @@ def asr_status():
         "last_final_age_sec": age(asr_diag.get("last_final_at")),
         "last_command": asr_diag.get("last_command") or "",
         "last_error": asr_diag.get("last_error") or "",
+        **{key: asr_diag.get(key) for key in (
+            "input_rms", "input_dbfs", "input_peak", "input_dc", "mic_muted",
+            "asr_dropped_frames", "asr_queue_frames", "asr_send_ms",
+            "keepalive_frames", "muted_frames", "max_packet_gap_ms", "pcm_frames",
+        )},
     }
 
 def _local_ipv4s() -> List[str]:
@@ -1332,6 +1360,25 @@ def _dev_control_allowed(request: Request) -> bool:
         return False
 
 
+@app.post("/api/dev/audio-test")
+async def dev_audio_test(request: Request):
+    """Play a short local test tone through the selected outputs without cloud calls."""
+    if not _dev_control_allowed(request):
+        raise HTTPException(status_code=403, detail="音频测试仅允许本机访问。")
+    import math
+    import struct
+    from .audio_stream import STREAM_SR
+    pcm = struct.pack("<%dh" % (STREAM_SR // 2), *(
+        int(1200 * math.sin(2 * math.pi * 440 * i / STREAM_SR))
+        for i in range(STREAM_SR // 2)
+    ))
+    for offset in range(0, len(pcm), 320):
+        await broadcast_pcm16_realtime(pcm[offset:offset + 320])
+        await asyncio.sleep(0.02)
+    await finish_pcm16_stream()
+    return {"ok": True, "playback_target": PLAYBACK_TARGET, "bytes": len(pcm)}
+
+
 @app.post("/api/dev/command")
 async def dev_command(request: Request):
     """本机硬件测试入口；不会启动 ASR，也不会产生语音识别调用费用。"""
@@ -1453,19 +1500,19 @@ async def ws_audio(ws: WebSocket):
     print("\n[AUDIO] client connected")
     recognition = None
     streaming = False
-    last_ts = time.monotonic()
-    keepalive_task: Optional[asyncio.Task] = None
+    sender: Optional[OrderedAudioSender] = None
+    framer = PcmFramer(SAMPLE_RATE, CHUNK_MS)
 
     async def stop_rec(send_notice: Optional[str] = None):
-        nonlocal recognition, streaming, keepalive_task
-        if keepalive_task and not keepalive_task.done():
-            keepalive_task.cancel()
-            try: await keepalive_task
-            except Exception: pass
-        keepalive_task = None
+        nonlocal recognition, streaming, sender
+        if sender is not None:
+            await sender.close()
+            sender = None
         if recognition:
-            try: recognition.stop()
-            except Exception: pass
+            try:
+                await asyncio.to_thread(recognition.stop)
+            except Exception:
+                pass
             recognition = None
         await set_current_recognition(None)
         streaming = False
@@ -1493,23 +1540,6 @@ async def ws_audio(ws: WebSocket):
                 pass
             return
         await stop_rec(send_notice="RESTART")
-
-    async def keepalive_loop():
-        nonlocal last_ts, recognition, streaming
-        try:
-            while streaming and recognition is not None:
-                idle = time.monotonic() - last_ts
-                if idle > 0.35:
-                    try:
-                        for _ in range(30):  # ~600ms 静音
-                            recognition.send_audio_frame(SILENCE_20MS)
-                        last_ts = time.monotonic()
-                    except Exception:
-                        await on_sdk_error("keepalive send failed")
-                        return
-                await asyncio.sleep(0.10)
-        except asyncio.CancelledError:
-            return
 
     try:
         while True:
@@ -1560,11 +1590,11 @@ async def ws_audio(ws: WebSocket):
                     )
 
                     try:
-                        recognition = dash_audio.asr.Recognition(
+                        recognition = QueuedRecognition(
                             api_key=API_KEY, model=MODEL, format=AUDIO_FMT,
                             sample_rate=SAMPLE_RATE, callback=cb
                         )
-                        recognition.start()
+                        await asyncio.to_thread(recognition.start)
                     except Exception as exc:
                         msg = f"recognition start failed: {exc}"
                         print(f"[ASR ERROR] {msg}", flush=True)
@@ -1574,19 +1604,18 @@ async def ws_audio(ws: WebSocket):
                         continue
                     await set_current_recognition(recognition)
                     streaming = True
-                    last_ts = time.monotonic()
                     _set_asr_diag(streaming=True, started_at=time.time(), last_audio_at=None, audio_chunks=0, last_error="", mic_muted=False)
-                    keepalive_task = asyncio.create_task(keepalive_loop())
+                    framer = PcmFramer(SAMPLE_RATE, CHUNK_MS)
+                    # This SDK method only appends to its own worker queue; per-frame
+                    # threadpool round-trips add Windows timer jitter to 20ms PCM.
+                    sender = OrderedAudioSender(recognition.send_audio_frame, on_sdk_error, offload=False)
+                    sender.start()
                     await ui_broadcast_partial("（已开始接收音频…）")
                     await ws.send_text("OK:STARTED")
 
                 elif cmd == "STOP":
                     print("[AUDIO] STOP received", flush=True)
                     _set_asr_diag(last_command="STOP")
-                    if recognition:
-                        for _ in range(15):  # ~300ms 静音
-                            try: recognition.send_audio_frame(SILENCE_20MS)
-                            except Exception: break
                     await stop_rec(send_notice="OK:STOPPED")
 
                 elif raw.startswith("PROMPT:"):
@@ -1600,30 +1629,22 @@ async def ws_audio(ws: WebSocket):
                         await ws.send_text("ERR:EMPTY_PROMPT")
 
             elif "bytes" in msg and msg["bytes"] is not None:
-                if streaming and recognition:
-                    try:
-                        pcm = msg["bytes"]
-                        muted = bool(MUTE_MIC_DURING_PLAYBACK and is_output_playing())
-                        was_muted = bool(asr_diag.get("mic_muted"))
-                        if muted:
-                            pcm = bytes(len(pcm))
-                        if muted != was_muted:
-                            print(
-                                "[AUDIO] 播报中已暂停麦克风推送" if muted else "[AUDIO] 播报结束，恢复麦克风推送",
-                                flush=True,
-                            )
-                        recognition.send_audio_frame(pcm)
-                        last_ts = time.monotonic()
-                        chunks = int(asr_diag.get("audio_chunks") or 0) + 1
-                        if chunks % 250 == 0:
-                            print(f"[AUDIO] ASR received {chunks} chunks", flush=True)
-                        _set_asr_diag(
-                            audio_chunks=chunks,
-                            last_audio_at=time.time(),
-                            mic_muted=muted,
+                if streaming and recognition and sender is not None:
+                    pcm = msg["bytes"]
+                    muted = bool(MUTE_MIC_DURING_PLAYBACK and is_output_playing())
+                    was_muted = bool(asr_diag.get("mic_muted"))
+                    if muted != was_muted:
+                        print(
+                            "[AUDIO] 播报中已暂停麦克风推送" if muted else "[AUDIO] 播报结束，恢复麦克风推送",
+                            flush=True,
                         )
-                    except Exception:
-                        await on_sdk_error("send_audio_frame failed")
+                    for frame in framer.feed(pcm, muted=muted):
+                        sender.offer(frame)
+                    chunks = framer.frames
+                    _set_asr_diag(
+                        audio_chunks=chunks, last_audio_at=time.time(), mic_muted=muted,
+                        **framer.snapshot(), **sender.snapshot(),
+                    )
 
     except Exception as e:
         print(f"\n[WS ERROR] {e}")
@@ -1642,13 +1663,20 @@ async def ws_audio(ws: WebSocket):
 # ---------- WebSocket：ESP32 相机入口（JPEG 二进制） ----------
 @app.websocket("/ws/camera")
 async def ws_camera_esp(ws: WebSocket):
-    global esp32_camera_ws, blind_path_navigator, cross_street_navigator, cross_street_active, navigation_active, orchestrator, camera_stats
+    global esp32_camera_ws, blind_path_navigator, cross_street_navigator, cross_street_active, navigation_active, orchestrator, camera_stats, camera_device_type, PLAYBACK_TARGET
     if esp32_camera_ws is not None:
         await ws.close(code=1013)
         return
     esp32_camera_ws = ws
     await ws.accept()
-    print("[CAMERA] ESP32 connected")
+    camera_device_type = "k230" if ws.query_params.get("device") == "k230" else "esp32"
+    camera_stats = {}
+    if camera_device_type == "k230":
+        if not PERFORMANCE_PROFILE.startswith("k230_"):
+            _apply_performance_profile("k230_1_5k")
+        PLAYBACK_TARGET = set_playback_target("both")
+        _persist_runtime_config()
+    print(f"[CAMERA] {camera_device_type.upper()} connected")
     
     # 【新增】初始化盲道导航器
     if blind_path_navigator is None and yolo_seg_model is not None:
@@ -1726,6 +1754,12 @@ async def ws_camera_esp(ws: WebSocket):
                     try:
                         camera_stats = json.loads(text[5:])
                         pipeline_metrics.update_esp32_camera(camera_stats)
+                        if camera_stats.get("device") == "k230" and camera_device_type != "k230":
+                            camera_device_type = "k230"
+                            PLAYBACK_TARGET = set_playback_target("both")
+                            if not PERFORMANCE_PROFILE.startswith("k230_"):
+                                _apply_performance_profile("k230_1_5k")
+                            await _send_camera_profile(ws)
                     except Exception:
                         pass
 
@@ -1755,6 +1789,23 @@ async def ws_camera_esp(ws: WebSocket):
 async def ws_viewer(ws: WebSocket):
     await ws.accept()
     camera_viewers.add(ws)
+    queue_: asyncio.Queue = asyncio.Queue(maxsize=1)
+    _viewer_queues[ws] = queue_
+
+    async def send_latest():
+        try:
+            while True:
+                jpeg = await queue_.get()
+                await asyncio.wait_for(ws.send_bytes(jpeg), timeout=0.5)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+    send_task = asyncio.create_task(send_latest())
     print(f"[VIEWER] Browser connected. Total viewers: {len(camera_viewers)}", flush=True)
     try:
         while True:
@@ -1767,9 +1818,12 @@ async def ws_viewer(ws: WebSocket):
     except WebSocketDisconnect:
         print("[VIEWER] Browser disconnected", flush=True)
     finally:
-        try: 
-            camera_viewers.remove(ws)
-        except Exception: 
+        _viewer_queues.pop(ws, None)
+        camera_viewers.discard(ws)
+        send_task.cancel()
+        try:
+            await send_task
+        except asyncio.CancelledError:
             pass
         print(f"[VIEWER] Removed. Total viewers: {len(camera_viewers)}", flush=True)
 
@@ -2053,5 +2107,5 @@ if __name__ == "__main__":
     uvicorn.run(
         app, host="0.0.0.0", port=8081,
         log_level="warning", access_log=False,
-        loop="asyncio", workers=1, reload=False
+        loop="asyncio", workers=1, reload=False, ws_per_message_deflate=False
     )

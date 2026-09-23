@@ -26,10 +26,17 @@
     height:100%;
     background:#020509; box-shadow:0 18px 50px rgba(0,0,0,.35); overflow:hidden;
   }
-  .canvas-wrap, #canvas{
+  .canvas-wrap{
     position:absolute; inset:0; width:100%; height:100%; display:block;
     background:radial-gradient(circle at 50% 35%,#101922 0,#05080d 48%,#000 100%);
     z-index:10
+  }
+  #canvas{
+    position:absolute; inset:0; width:100%; height:100%; display:block;
+    object-fit:contain; object-position:center;
+    background:transparent;
+    z-index:10;
+    image-rendering:auto;
   }
   .stage-empty{
     position:absolute; inset:0; z-index:18;
@@ -562,6 +569,18 @@
               <option value="smooth">流畅（640×480 / 24 帧）</option>
               <option value="balanced" selected>平衡（640×480 / 20 帧）</option>
               <option value="quality">清晰（800×600 / 15 帧）</option>
+              <option value="k230_hd">K230 720p（1280×720 / 30 帧）</option>
+              <option value="k230_1k">K230 1K（1280×960 / 25 帧）</option>
+              <option value="k230_1_5k">K230 1.5K（1536×864 / 25 帧）</option>
+              <option value="k230_fhd">K230 1080p（1920×1080 / 20 帧）</option>
+            </select>
+          </div>
+          <div class="field-row">
+            <label for="playbackTargetInput">播放目标</label>
+            <select id="playbackTargetInput">
+              <option value="server" selected>仅电脑</option>
+              <option value="esp32">仅设备</option>
+              <option value="both">电脑和设备</option>
             </select>
           </div>
           <label class="toggle-card" for="muteMicDuringPlaybackInput">
@@ -663,6 +682,6 @@
 }</script>
 
 <!-- 主脚本 -->
-<script type="module" src="/static/main.js?v=20260706-mutemic"></script>
+<script type="module" src="/static/main.js?v=20260923-k230-hd-audio"></script>
 </body>
 </html>
