@@ -26,10 +26,17 @@
     height:100%;
     background:#020509; box-shadow:0 18px 50px rgba(0,0,0,.35); overflow:hidden;
   }
-  .canvas-wrap, #canvas{
+  .canvas-wrap{
     position:absolute; inset:0; width:100%; height:100%; display:block;
     background:radial-gradient(circle at 50% 35%,#101922 0,#05080d 48%,#000 100%);
     z-index:10
+  }
+  #canvas{
+    position:absolute; inset:0; width:100%; height:100%; display:block;
+    object-fit:contain; object-position:center;
+    background:transparent;
+    z-index:10;
+    image-rendering:auto;
   }
   .stage-empty{
     position:absolute; inset:0; z-index:18;
@@ -49,6 +56,17 @@
     position:absolute; left:14px; top:14px; z-index:30;
     display:flex; gap:8px; flex-wrap:wrap; align-items:center;
     max-width:calc(100% - 340px);
+    pointer-events:none;
+  }
+  .inference-banner{
+    position:absolute; left:14px; bottom:16px; z-index:30;
+    max-width:min(760px, calc(100% - 28px));
+    padding:10px 14px; border-radius:10px;
+    color:#eaf4ff; background:rgba(7,14,23,.82);
+    border:1px solid rgba(75,139,220,.48);
+    box-shadow:0 10px 26px rgba(0,0,0,.28);
+    backdrop-filter:blur(8px);
+    font-size:14px; font-weight:700;
     pointer-events:none;
   }
 
@@ -201,6 +219,34 @@
     border:1px solid #26364c; border-radius:8px;
     padding:7px 9px; font:12px/1.4 Consolas,monospace;
   }
+  .field-row select{
+    width:100%; min-width:0; height:34px;
+    background:#071019; color:var(--text);
+    border:1px solid #26364c; border-radius:8px;
+    padding:6px 9px; font-size:12px;
+  }
+  .toggle-card{
+    display:flex; gap:10px; align-items:flex-start;
+    padding:8px 9px; border:1px solid #1b2a3e; border-radius:8px;
+    background:#08111a;
+  }
+  .toggle-card input[type="checkbox"]{
+    width:16px; height:16px; margin:2px 0 0 0; flex:0 0 auto; accent-color:#1f6feb;
+  }
+  .toggle-copy{min-width:0}
+  .toggle-copy strong{display:block; color:#dce9f7; font-size:12px; font-weight:700}
+  .toggle-copy small{display:block; color:var(--muted); font-size:11px; line-height:1.45; margin-top:2px}
+  .perf-grid{
+    display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px;
+    margin-top:8px;
+  }
+  .perf-item{
+    padding:7px 8px; border:1px solid #1b2a3e; border-radius:8px;
+    background:#08111a; color:var(--muted); font-size:11px;
+  }
+  .perf-item strong{display:block;color:#dce9f7;font-size:13px}
+  .dev-controls{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+  .dev-controls button{padding:6px 9px;font-size:11px;border-radius:8px}
   .config-actions{display:flex;gap:8px;margin-top:8px;align-items:center}
   .config-actions button{padding:7px 10px;border-radius:8px;font-size:12px}
   .mini-status{font-size:12px;color:var(--muted)}
@@ -462,10 +508,11 @@
       <span>后端已运行，ESP32 摄像头尚未接入</span>
     </div>
     <div class="stage-status">
-      <span id="camStatusStage" class="badge warn">Camera HW: waiting</span>
-      <span id="audioStatusStage" class="badge warn">Audio HW: waiting</span>
-      <span id="yoloStatusStage" class="badge">YOLO: idle</span>
+      <span id="camStatusStage" class="badge warn">摄像头：等待接入</span>
+      <span id="audioStatusStage" class="badge warn">麦克风：等待接入</span>
+      <span id="yoloStatusStage" class="badge">视觉推理：空闲</span>
     </div>
+    <div id="inferenceStatus" class="inference-banner">系统已就绪，等待摄像头画面</div>
 
     <!-- 左上角：IMU 浮窗（横向） -->
     <div class="imu-float">
@@ -474,9 +521,9 @@
         <div id="imu_hud"><!-- JS 会把“IMU 实时数据面板”插到这里 --></div>
       </div>
       <div id="imu_top_status" style="display: none;">
-        <span class="badge">UDP: <code>12345</code></span>
-        <span class="badge">Browser WS: <code>/ws</code></span>
-        <span class="badge" id="imu_ws_state">connecting…</span>
+        <span class="badge">惯导端口：<code>12345</code></span>
+        <span class="badge">浏览器通道：<code>/ws</code></span>
+        <span class="badge" id="imu_ws_state">正在连接</span>
       </div>
     </div>
 
@@ -488,15 +535,17 @@
   <aside class="chat">
     <div class="chat-head">
       <div class="badges">
-        <span id="camStatus" class="badge">Viewer: connecting…</span>
-        <span id="asrStatus" class="badge">UI: connecting…</span>
-        <span id="modeStatus" class="badge">Mode: --</span>
-        <span id="speakerStatus" class="badge">Speaker: --</span>
-        <span id="yoloStatus" class="badge">YOLO: idle</span>
-        <span id="fps" class="badge">FPS: --</span>
+        <span id="camStatus" class="badge">画面连接：正在连接</span>
+        <span id="asrStatus" class="badge">状态连接：正在连接</span>
+        <span id="modeStatus" class="badge">运行模式：未知</span>
+        <span id="speakerStatus" class="badge">扬声器：未知</span>
+        <span id="modelStatus" class="badge">视觉模型：空闲</span>
+        <span id="targetStatus" class="badge">推理目标：无</span>
+        <span id="yoloStatus" class="badge">视觉推理：空闲</span>
+        <span id="fps" class="badge">显示帧率：--</span>
       </div>
       <div class="controls">
-        <button class="ghost" id="btnClear">清空 Final</button>
+        <button class="ghost" id="btnClear">清空记录</button>
         <button id="btnReconnect">重连</button>
       </div>
     </div>
@@ -514,6 +563,33 @@
             <label for="dashscopeKeyInput">API Key</label>
             <input id="dashscopeKeyInput" type="password" placeholder="DASHSCOPE_API_KEY">
           </div>
+          <div class="field-row">
+            <label for="performanceProfileInput">性能档位</label>
+            <select id="performanceProfileInput">
+              <option value="smooth">流畅（640×480 / 24 帧）</option>
+              <option value="balanced" selected>平衡（640×480 / 20 帧）</option>
+              <option value="quality">清晰（800×600 / 15 帧）</option>
+              <option value="k230_hd">K230 720p（1280×720 / 30 帧）</option>
+              <option value="k230_1k">K230 1K（1280×960 / 25 帧）</option>
+              <option value="k230_1_5k">K230 1.5K（1536×864 / 25 帧）</option>
+              <option value="k230_fhd">K230 1080p（1920×1080 / 20 帧）</option>
+            </select>
+          </div>
+          <div class="field-row">
+            <label for="playbackTargetInput">播放目标</label>
+            <select id="playbackTargetInput">
+              <option value="server" selected>仅电脑</option>
+              <option value="esp32">仅设备</option>
+              <option value="both">电脑和设备</option>
+            </select>
+          </div>
+          <label class="toggle-card" for="muteMicDuringPlaybackInput">
+            <input id="muteMicDuringPlaybackInput" type="checkbox" checked>
+            <span class="toggle-copy">
+              <strong>播报时暂停麦克风</strong>
+              <small>电脑或云端喇叭出声时，不把麦克风音频送去语音识别，避免把播报内容再次推理。</small>
+            </span>
+          </label>
           <div class="config-section-title">模型路径</div>
           <div class="field-row">
             <label for="blindPathModelInput">盲道分割</label>
@@ -540,6 +616,25 @@
           <button id="btnSaveRuntime">保存配置</button>
           <span id="runtimeConfigStatus" class="mini-status">读取配置中…</span>
         </div>
+        <div class="config-section-title">本机快速验证</div>
+        <div class="dev-controls">
+          <button data-dev-command="find" data-target="手机">寻找手机</button>
+          <button class="ghost" data-dev-command="stop_find">停止找物</button>
+          <button data-dev-command="blindpath">盲道导航</button>
+          <button data-dev-command="traffic">红绿灯检测</button>
+          <button class="ghost" data-dev-command="chat">返回聊天</button>
+        </div>
+        <div class="config-section-title">实时性能</div>
+        <div class="perf-grid">
+          <div class="perf-item">采集帧率<strong id="captureFps">--</strong></div>
+          <div class="perf-item">处理帧率<strong id="processFps">--</strong></div>
+          <div class="perf-item">显示帧率<strong id="broadcastFps">--</strong></div>
+          <div class="perf-item">推理帧率<strong id="inferenceFps">--</strong></div>
+          <div class="perf-item">推理耗时<strong id="inferenceMs">--</strong></div>
+          <div class="perf-item">端到端延迟<strong id="latencyMs">--</strong></div>
+          <div class="perf-item">后端丢帧<strong id="outputDrops">0</strong></div>
+          <div class="perf-item">设备信号/内存<strong id="deviceMetrics">--</strong></div>
+        </div>
         <div class="endpoint-list">
           <div class="endpoint-row"><span>摄像头</span><code id="cameraWsText">-</code><button class="copy-btn" data-copy-target="cameraWsText">复制</button></div>
           <div class="endpoint-row"><span>音频</span><code id="audioWsText">-</code><button class="copy-btn" data-copy-target="audioWsText">复制</button></div>
@@ -548,11 +643,11 @@
         </div>
       </details>
       <div class="live">
-        <h2>流式识别（Partial）</h2>
+        <h2>流式识别</h2>
         <div class="partial" id="partial">（等待音频…）</div>
       </div>
       <div class="finals">
-        <h2>最终文本（Final）</h2>
+        <h2>最终文本</h2>
         <ul id="finalList"></ul>
       </div>
     </div>
@@ -587,6 +682,6 @@
 }</script>
 
 <!-- 主脚本 -->
-<script type="module" src="/static/main.js?v=20260617-layout1"></script>
+<script type="module" src="/static/main.js?v=20260923-k230-hd-audio"></script>
 </body>
 </html>

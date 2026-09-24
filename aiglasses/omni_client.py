@@ -9,6 +9,11 @@ from openai import OpenAI
 
 API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 QWEN_MODEL = "qwen-omni-turbo"
+DEFAULT_SYSTEM_PROMPT = (
+    "你是 AI 眼镜语音助手。使用简体中文直接回答，默认只说 1 到 2 句、50 字以内。"
+    "不要复述问题，不要寒暄；只有安全提醒、导航或用户明确要求详细说明时，才补充必要步骤。"
+)
+CONCISE_USER_REMINDER = "回答要求：请用简体中文，直接回答，通常不超过两句或50字。"
 
 oai_client = OpenAI(
     api_key=API_KEY or "missing-key",
@@ -64,6 +69,7 @@ async def stream_chat(
     content_list: List[Dict[str, Any]],
     voice: str = "Cherry",
     audio_format: str = "wav",
+    system_prompt: Optional[str] = None,
 ) -> AsyncGenerator[OmniStreamPiece, None]:
     loop = asyncio.get_running_loop()
     q: "asyncio.Queue[object]" = asyncio.Queue()
@@ -71,11 +77,21 @@ async def stream_chat(
 
     def _worker():
         try:
+            user_content = list(content_list)
+            user_content.append({"type": "text", "text": CONCISE_USER_REMINDER})
             completion = oai_client.chat.completions.create(
                 model=QWEN_MODEL,
-                messages=[{"role": "user", "content": content_list}],
+                messages=[
+                    {
+                        "role": "system",
+                        "content": system_prompt
+                        or os.getenv("AIGLASS_OMNI_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT),
+                    },
+                    {"role": "user", "content": user_content},
+                ],
                 modalities=["text", "audio"],
                 audio={"voice": voice, "format": audio_format},
+                max_tokens=max(32, int(os.getenv("AIGLASS_OMNI_MAX_TOKENS", "96"))),
                 stream=True,
                 stream_options={"include_usage": True},
             )

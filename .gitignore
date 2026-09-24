@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+k230_secrets.py
 
 # Python caches and virtual environments
 __pycache__/
@@ -33,6 +34,20 @@ mobileclip2_b.ts
 
 # Large local model/assets
 model/
+
+# Report/docx generation scratch
+_report_assets/
+_template_unpack/
+*.docx
+!docs/**/*.docx
+
+# Local photos dropped next to firmware
+compile/*.jpg
+compile/*.jpeg
+compile/*.png
+
+# Node scratch
+node_modules/
 
 # OS/editor noise
 .DS_Store

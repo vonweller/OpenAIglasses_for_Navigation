@@ -28,6 +28,7 @@ except ModuleNotFoundError:
 from ultralytics import YOLO
 from ultralytics.utils.plotting import Colors
 from . import bridge_io
+from .performance import pipeline_metrics
 from .paths import MODEL_DIR as PROJECT_MODEL_DIR
 try:
     import pygame  # 用于播放本地音频文件
@@ -167,9 +168,7 @@ AUDIO_FILES = {
 }
 GUIDANCE_INTERVAL_SEC = 1.5  # 引导播报间隔
 
-# 初始化pygame音频
-if pygame is not None:
-    pygame.mixer.init()
+# pygame 仅作可选依赖保留，不再抢占本机默认声卡。
 
 # ========= 窗口 =========
 WINDOW = "YOLO Seg + Flow Polygon (Peri-Relock) (Grab Guidance)"
@@ -682,6 +681,7 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
     colors = Colors()
 
     FRAME_IDX    = 0
+    last_source_seq = 0
     last_mask    = None      # 上一帧"目标掩膜"（用于 IoU 降噪）
     flow_mask    = None      # 光流外推得到的掩膜（你现有代码里会更新它）
     flow_grace   = 0         # YOLOE 丢检后，允许光流顶住的计数
@@ -707,7 +707,7 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
     yoloe_backend = None
     if _YOLOE_READY:
         try:
-            bridge_io.set_yolo_status(running=True, phase="loading", target=PROMPT_NAME, backend="YOLOE")
+            bridge_io.set_yolo_status(running=True, phase="loading", target=PROMPT_NAME, backend="YOLOE", mode=MODE)
             yoloe_backend = YoloEBackend()                  # 可用 YOLOE_MODEL_PATH 环境变量指定模型
             bridge_io.set_yolo_status(
                 running=True,
@@ -716,6 +716,7 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                 backend="YOLOE",
                 device=str(getattr(yoloe_backend, "device", "")),
                 model_path=str(getattr(yoloe_backend, "model_path", "")),
+                mode=MODE,
             )
             yoloe_backend.set_text_classes([PROMPT_NAME])   # 文本类别
             use_yoloe = True
@@ -727,11 +728,23 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                 device=str(getattr(yoloe_backend, "device", "")),
                 model_path=str(getattr(yoloe_backend, "model_path", "")),
                 last_error="",
+                mode=MODE,
             )
             print(f"[DETECTOR] YOLOE text-prompt backend enabled for: {PROMPT_NAME}", flush=True)
         except Exception as e:
-            print(f"[DETECTOR] YOLOE init failed: {e}", flush=True)
-            bridge_io.set_yolo_status(running=False, phase="failed", target=PROMPT_NAME, last_error=str(e))
+            technical_error = str(e)
+            if "same dtype" in technical_error or "Half != float" in technical_error:
+                user_error = "视觉模型精度不兼容，正在恢复，请再试一次寻找。"
+            else:
+                user_error = "视觉模型初始化失败，找物暂不可用。"
+            print(f"[DETECTOR] YOLOE init failed: {technical_error}", flush=True)
+            bridge_io.set_yolo_status(
+                running=False,
+                phase="failed",
+                target=PROMPT_NAME,
+                last_error=user_error,
+                technical_error=technical_error,
+            )
     else:
         print("[DETECTOR] YOLOE backend not ready (import failed)", flush=True)
         bridge_io.set_yolo_status(running=False, phase="failed", target=PROMPT_NAME, last_error="YOLOE backend import failed")
@@ -827,13 +840,23 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                 print("[YOLOMEDIA] Stop event detected, exiting...")
                 break
                 
-            frame = bridge_io.wait_raw_bgr(timeout_sec=0.5)
-            if frame is None:
+            packet = bridge_io.wait_next_raw_bgr(last_source_seq, timeout_sec=0.5)
+            if packet is None:
                 # 没取到帧就继续等（ESP32还没连上或暂时无新帧）
+                status = bridge_io.get_yolo_status()
+                if status.get("phase") != "camera_waiting":
+                    bridge_io.set_yolo_status(
+                        running=True,
+                        phase="camera_waiting",
+                        target=PROMPT_NAME,
+                        mode=MODE,
+                    )
                 # [headless] 给出 1ms 让出调度，避免空转；不调用 highgui waitKey
                 if headless:
                     time.sleep(0.001)
                 continue
+            last_source_seq = packet.seq
+            frame = packet.bgr
             
             # 每帧重置 UI 文字叠加到左下角
             H, W = frame.shape[:2]
@@ -886,14 +909,20 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
             if MODE == "SEGMENT":
                 # —— 仅 YOLOE：每帧文本提示分割 + 取最大目标（删掉 shoppingbest 与重复 YOLOE 段）——
                 FRAME_IDX += 1
-                if FRAME_IDX % 10 == 1:
-                    bridge_io.set_yolo_status(running=True, phase="infer", target=PROMPT_NAME, frames=FRAME_IDX)
                 candidate_masks = []
                 detected_object = False
 
                 if use_yoloe and yoloe_backend is not None:
                     should_infer = (last_yoloe_det is None) or (FRAME_IDX % YOLOE_SEGMENT_INTERVAL == 1)
                     if should_infer:
+                        bridge_io.set_yolo_status(
+                            running=True,
+                            phase="infer",
+                            target=PROMPT_NAME,
+                            frames=FRAME_IDX,
+                            inferences=yoloe_infer_count,
+                            mode=MODE,
+                        )
                         t0 = time.time()
                         det = yoloe_backend.segment(frame, conf=0.20, iou=0.45, imgsz=YOLOE_IMGSZ, persist=True)
                         last_yoloe_det = det
@@ -904,12 +933,16 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
 
                     bridge_io.set_yolo_status(
                         running=True,
-                        phase="infer",
+                        phase="detected" if len(det.get("masks", [])) else "result_miss",
                         target=PROMPT_NAME,
                         frames=FRAME_IDX,
                         inferences=yoloe_infer_count,
                         detections=len(det.get("masks", [])),
+                        mode=MODE,
                         last_error="",
+                        source_seq=packet.seq,
+                        frame_age_ms=max(0.0, (time.time() - packet.captured_at) * 1000.0),
+                        inference_ms=last_yoloe_dt * 1000.0,
                     )
                     if should_infer and yoloe_infer_count % 10 == 0:
                         print(f"[YOLOE] infer frame={FRAME_IDX} detections={len(det.get('masks', []))} dt={last_yoloe_dt:.3f}s", flush=True)
@@ -1144,16 +1177,26 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                                     # 添加调试信息
                                     if FRAME_IDX % 30 == 0:  # 每30帧打印一次
                                         print(f"[YOLOE] 实时检测第 {FRAME_IDX} 帧")
-                                    t0 = time.time()
-                                    det = yoloe_backend.segment(frame, conf=0.20, iou=0.45, imgsz=YOLOE_IMGSZ, persist=True)
-                                    yoloe_infer_count += 1
                                     bridge_io.set_yolo_status(
                                         running=True,
                                         phase="infer",
                                         target=PROMPT_NAME,
                                         frames=FRAME_IDX,
                                         inferences=yoloe_infer_count,
+                                        mode=MODE,
+                                    )
+                                    t0 = time.time()
+                                    det = yoloe_backend.segment(frame, conf=0.20, iou=0.45, imgsz=YOLOE_IMGSZ, persist=True)
+                                    yoloe_infer_count += 1
+                                    bridge_io.set_yolo_status(
+                                        running=True,
+                                        phase="tracking" if len(det.get("masks", [])) else "result_miss",
+                                        target=PROMPT_NAME,
+                                        frames=FRAME_IDX,
+                                        inferences=yoloe_infer_count,
                                         detections=len(det.get("masks", [])),
+                                        inference_ms=(time.time() - t0) * 1000.0,
+                                        mode=MODE,
                                         last_error="",
                                     )
                                     if FRAME_IDX % 30 == 0:
@@ -1385,22 +1428,36 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                             if len(poly) >= 3:
                                 # 统一的 YOLOE 实时检测和校正（每帧）
                                 latest_det_mask = None
-                                if use_yoloe and yoloe_backend is not None:
+                                if (
+                                    use_yoloe
+                                    and yoloe_backend is not None
+                                    and track_frame_count % YOLOE_TRACK_INTERVAL == 0
+                                ):
                                     # 添加调试信息
                                     if track_frame_count % 30 == 0:  # 每30帧打印一次
                                         print(f"[YOLOE] TRACK模式实时检测第 {track_frame_count} 帧")
                                     
                                     # YOLOE 实时检测（统一调用，避免重复）
-                                    t0 = time.time()
-                                    det = yoloe_backend.segment(frame, conf=YOLO_CORRECTION_CONF_THRESHOLD, iou=0.45, imgsz=YOLOE_IMGSZ, persist=True)
-                                    yoloe_infer_count += 1
                                     bridge_io.set_yolo_status(
                                         running=True,
                                         phase="infer",
                                         target=PROMPT_NAME,
                                         frames=track_frame_count,
-                                        inferences=track_frame_count,
+                                        inferences=yoloe_infer_count,
+                                        mode=MODE,
+                                    )
+                                    t0 = time.time()
+                                    det = yoloe_backend.segment(frame, conf=YOLO_CORRECTION_CONF_THRESHOLD, iou=0.45, imgsz=YOLOE_IMGSZ, persist=True)
+                                    yoloe_infer_count += 1
+                                    bridge_io.set_yolo_status(
+                                        running=True,
+                                        phase="tracking" if len(det.get("masks", [])) else "result_miss",
+                                        target=PROMPT_NAME,
+                                        frames=track_frame_count,
+                                        inferences=yoloe_infer_count,
                                         detections=len(det.get("masks", [])),
+                                        inference_ms=(time.time() - t0) * 1000.0,
+                                        mode=MODE,
                                         last_error="",
                                     )
                                     if track_frame_count % 30 == 0:
@@ -1633,6 +1690,10 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
             draw_command_pill(vis, CURRENT_COMMAND_TEXT)
 
             # 展示（无论 headless 与否，都会推给前端）
+            pipeline_metrics.on_processed(
+                captured_at=packet.captured_at,
+                inference_ms=last_yoloe_dt * 1000.0 if last_yoloe_dt > 0 else None,
+            )
             bridge_io.send_vis_bgr(vis)
 
             # [headless] 只有非 headless 时才弹窗与键盘交互；headless 下只让出调度
