@@ -26,7 +26,21 @@
 
 ## 目录与运行
 
-将本目录的 `main.py`、`config.py`、`camera.py`、`audio_io.py`、`device_protocol.py`、`ws_client.py`、`wav_stream.py` 放到 `/sdcard/`。
+板上按项目分目录存放。当前自启入口是根目录的小型启动器 `/sdcard/main.py`，它把 `/sdcard/projects/aidemo` 加入路径后运行主程序；实验程序在 `/sdcard/projects/protolab`。
+
+```text
+/sdcard/
+├── main.py                 # 启动器：sys.path 加入 projects/aidemo 后 import main
+├── k230_secrets.py         # 私有连接配置（仍由 secrets.example.py 生成）
+└── projects/
+    ├── aidemo/             # 智能眼镜主程序
+    │   ├── main.py config.py camera.py audio_io.py
+    │   ├── device_protocol.py ws_client.py wav_stream.py
+    │   └── （无独立 secrets；连接读取根目录 k230_secrets.py）
+    └── protolab/           # 协议实验测试程序，不再随主程序部署
+```
+
+部署目标改为 `--destination /sdcard/projects/aidemo`；`k230_secrets.py` 仍在 `/sdcard/` 根目录单独维护，deploy 排除它。2026-10-03 整理前散在根目录的旧程序已改名 `*.py.old` 保留，历史 `.previous` 备份先存回电脑（`.codex_tmp/k230/board-organization/`）后从板上删除。此前的 `firmware/k230/projects/` 命名建议未采用；保持根目录单一启动器即可，勿重复创建。
 
 将 `secrets.example.py` 复制为板上的 `/sdcard/k230_secrets.py`，填入实际 Wi-Fi 和电脑局域网地址。真实文件已加入 Git 忽略规则，部署工具不会上传/覆盖它。端口默认8081；不要使用其他会话遗留的服务器地址。
 
@@ -52,13 +66,13 @@ POST /api/runtime-config
 ```powershell
 python tools/k230_board.py --port COM_PORT info
 python tools/k230_board.py --port COM_PORT backup --output .codex_tmp/k230/manual-backup /sdcard/main.py /sdcard/k230_secrets.py
-python tools/k230_board.py --port COM_PORT deploy firmware/k230 --backup .codex_tmp/k230/backups
+python tools/k230_board.py --port COM_PORT deploy firmware/k230/projects/aidemo --destination /sdcard/projects/aidemo --backup .codex_tmp/k230/backups
 ```
 
 - 工具先 Ctrl-C 停止当前程序；`info` 也会暂停运行，不能当无侵入监控。
 - deploy先备份所有待替换文件，分块上传到临时路径，逐文件读回校验，旧版改名保留，`main.py` 最后安装。不擦盘、不刷镜像。
 - Git Bash 调 Windows Python 且参数含 `/sdcard/` 时，加 `MSYS_NO_PATHCONV=1`；否则MSYS会改坏板路径。
-- 可先建隔离 `/sdcard/k230_probe` 并用 `--destination /sdcard/k230_probe` 测试，不修改离线启动入口。
+- 隔离试验可用其他 `--destination` 目录；启动器只指向 `projects/aidemo`，不影响自启。
 - 回退：停止客户端，将备份中的旧程序恢复到原路径；私有配置同样从本地保密备份恢复。不要把备份目录加入Git。
 - `/sdcard/main.py` 在复位后自启；REPL soft reboot也可能运行main。诊断前不要盲发Ctrl-D。
 
