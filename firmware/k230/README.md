@@ -31,16 +31,16 @@
 ```text
 /sdcard/
 ├── main.py                 # 启动器：sys.path 加入 projects/aidemo 后 import main
-├── k230_secrets.py         # 私有连接配置（仍由 secrets.example.py 生成）
+├── k230_secrets.py         # 私有连接配置：全板唯一一份，所有项目共享（勿放进项目子目录）
 └── projects/
     ├── aidemo/             # 智能眼镜主程序
     │   ├── main.py config.py camera.py audio_io.py
     │   ├── device_protocol.py ws_client.py wav_stream.py
-    │   └── （无独立 secrets；连接读取根目录 k230_secrets.py）
+    │   └── （不含 secrets；config.py 找不到时会自动回退搜索 /sdcard）
     └── protolab/           # 协议实验测试程序，不再随主程序部署
 ```
 
-部署目标改为 `--destination /sdcard/projects/aidemo`；`k230_secrets.py` 仍在 `/sdcard/` 根目录单独维护，deploy 排除它。2026-10-03 整理前散在根目录的旧程序已改名 `*.py.old` 保留，历史 `.previous` 备份先存回电脑（`.codex_tmp/k230/board-organization/`）后从板上删除。此前的 `firmware/k230/projects/` 命名建议未采用；保持根目录单一启动器即可，勿重复创建。
+部署目标改为 `--destination /sdcard/projects/aidemo`；`k230_secrets.py` 只放在 `/sdcard/` 根目录单独维护，deploy 排除它。2026-10-03 整理前散在根目录的旧程序已改名 `*.py.old` 保留，历史 `.previous` 备份先存回电脑（`.codex_tmp/k230/board-organization/`）后从板上删除。整理时曾误把 secrets 复制进 aidemo 并将根目录原件改名 `.old`，已恢复为根目录唯一一份；`config.py` 的根目录回退保证直接用 IDE 运行子目录脚本也能找到配置。
 
 将 `secrets.example.py` 复制为板上的 `/sdcard/k230_secrets.py`，填入实际 Wi-Fi 和电脑局域网地址。真实文件已加入 Git 忽略规则，部署工具不会上传/覆盖它。端口默认8081；不要使用其他会话遗留的服务器地址。
 

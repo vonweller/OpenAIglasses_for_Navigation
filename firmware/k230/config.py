@@ -25,7 +25,15 @@ RUN_SECONDS = 0
 
 
 def load_secrets():
-    import k230_secrets
+    try:
+        import k230_secrets
+    except ImportError:
+        # Projects live in subdirectories; the shared private config stays in /sdcard.
+        import sys
+
+        if "/sdcard" not in sys.path:
+            sys.path.append("/sdcard")
+        import k230_secrets
 
     values = {}
     for name in ("WIFI_SSID", "WIFI_PASSWORD", "SERVER_HOST", "SERVER_PORT"):
