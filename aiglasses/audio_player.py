@@ -8,7 +8,7 @@ import asyncio
 import threading
 import queue
 import time
-from .audio_stream import broadcast_pcm16_realtime
+from .audio_stream import broadcast_pcm16_realtime, finish_pcm16_stream
 from .audio_compressor import compressed_audio_cache, AudioCompressor
 from .paths import VOICE_DIR as PROJECT_VOICE_DIR
 
@@ -234,6 +234,7 @@ async def _broadcast_audio_optimized(pcm_data: bytes):
 
         # 单次调用交给底层 pacing（20ms节拍在 broadcast_pcm16_realtime 内部实现）
         await broadcast_pcm16_realtime(full_audio)
+        await finish_pcm16_stream()
 
         _last_play_ts = time.monotonic()
     except Exception as e:
@@ -242,6 +243,17 @@ async def _broadcast_audio_optimized(pcm_data: bytes):
         # 清除播放标志
         with _playing_lock:
             _is_playing = False
+
+def is_voice_playing() -> bool:
+    """预录提示音正在入队或正在送往扬声器。"""
+    with _playing_lock:
+        if _is_playing:
+            return True
+    try:
+        return _audio_queue.qsize() > 0
+    except Exception:
+        return False
+
 
 def initialize_audio_system():
     """初始化音频系统"""

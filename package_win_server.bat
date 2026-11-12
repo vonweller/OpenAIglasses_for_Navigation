@@ -212,8 +212,14 @@ for %%F in (
     "requirements.txt"
     "setup.bat"
     "tools\prepare_models.py"
+    "tools\desktop_esp32_simulator.py"
     "aiglasses\app_main.py"
+    "aiglasses\performance.py"
+    "aiglasses\audio_stream.py"
     "aiglasses\yoloe_backend.py"
+    "static\main.js"
+    "templates\index.html"
+    "compile\compile.ino"
 ) do (
     if exist "%STAGE_DIR%\%%~F" (
         echo [OK] %%~F
@@ -253,9 +259,13 @@ echo [3/4] Writing server notes...
     echo - runtime_config.json is excluded because it may contain local absolute paths.
     echo - .venv, .venv-run, logs, recordings, .git, .vs, and __pycache__ are excluded.
     echo - setup.bat will create .venv-run, install pinned dependencies, prepare models, and start the backend.
+    echo - setup.bat --check also validates the packaged runtime files and an existing .venv-run environment.
     echo - The item-search model defaults to model/yoloe-26s-seg.pt with ultralytics==8.4.88.
     echo - YOLOE-26S requires mobileclip2_b.ts. If it is not bundled, setup.bat downloads it automatically.
     echo - If the server has an NVIDIA GPU, setup.bat installs the CUDA 12.1 PyTorch wheel and verifies torch.cuda.
+    echo - Performance profiles are available in the web UI: smooth, balanced, and clear.
+    echo - Desktop simulator: .venv-run\Scripts\python.exe tools\desktop_esp32_simulator.py --host 127.0.0.1 --port 8081
+    echo - Add --synthetic to the simulator command when the server has no local camera.
     echo.
     echo Default server endpoints after setup:
     echo - UI: http://SERVER_IP:8081/

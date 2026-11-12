@@ -11,6 +11,7 @@ set "CHECK_ONLY=0"
 set "SKIP_MODELS=0"
 set "NO_PAUSE=0"
 set "KILL_PORT=0"
+set "STOP_ONLY=0"
 set "PYTHONNOUSERSITE=1"
 set "PIP_DISABLE_PIP_VERSION_CHECK=1"
 
@@ -21,10 +22,25 @@ if /I "%~1"=="--reinstall" set "FORCE_INSTALL=1"
 if /I "%~1"=="--no-models" set "SKIP_MODELS=1"
 if /I "%~1"=="--no-pause" set "NO_PAUSE=1"
 if /I "%~1"=="--kill-port" set "KILL_PORT=1"
+if /I "%~1"=="--stop" set "STOP_ONLY=1"
 shift
 goto parse_args
 
 :args_done
+if "%STOP_ONLY%"=="1" (
+    echo ============================================================
+    echo   %APP_NAME% - stop backend
+    echo ============================================================
+    echo Project: %CD%
+    echo.
+    call :stop_our_backend
+    if errorlevel 1 goto failed
+    echo [OK] Project backend on port %PORT% is stopped.
+    echo.
+    if "%NO_PAUSE%"=="0" pause
+    exit /b 0
+)
+
 echo ============================================================
 echo   %APP_NAME% - one click setup and start
 echo ============================================================
@@ -38,7 +54,48 @@ call :detect_gpu
 call :get_local_ip
 
 if "%CHECK_ONLY%"=="1" (
+    set "CHECK_FAILED=0"
+    set "PY=%CD%\%VENV_DIR%\Scripts\python.exe"
     echo.
+    echo [CHECK] Verifying required project files...
+    for %%F in (
+        "app_main.py"
+        "requirements.txt"
+        "aiglasses\app_main.py"
+        "aiglasses\performance.py"
+        "aiglasses\audio_stream.py"
+        "tools\desktop_esp32_simulator.py"
+        "static\main.js"
+        "templates\index.html"
+    ) do (
+        if exist "%%~F" (
+            echo [OK] %%~F
+        ) else (
+            echo [ERROR] Missing required file: %%~F
+            set "CHECK_FAILED=1"
+        )
+    )
+
+    if exist "!PY!" (
+        echo.
+        echo [CHECK] Verifying existing %VENV_DIR% dependencies...
+        call :check_runtime_deps
+        if errorlevel 1 (
+            echo [ERROR] Existing environment is missing or has incompatible dependencies.
+            echo         Run setup.bat --reinstall to repair it.
+            set "CHECK_FAILED=1"
+        ) else (
+            echo [OK] Existing runtime dependencies are ready.
+        )
+    ) else (
+        echo [INFO] %VENV_DIR% does not exist yet. Normal setup will create it.
+    )
+
+    echo.
+    if "!CHECK_FAILED!"=="1" (
+        echo [ERROR] Check finished with problems. No install or startup was performed.
+        exit /b 1
+    )
     echo [OK] Check finished. No install or startup was performed.
     echo      Local UI:     http://127.0.0.1:%PORT%/
     echo      LAN UI:       http://%LOCAL_IP%:%PORT%/
@@ -78,12 +135,17 @@ echo IMU WS:       ws://%LOCAL_IP%:%PORT%/ws
 echo Logs:         %CD%\logs\backend.stdout.log
 echo Errors:       %CD%\logs\backend.stderr.log
 echo.
+echo Desktop simulator:
+echo   "%PY%" tools\desktop_esp32_simulator.py --host 127.0.0.1 --port %PORT%
+echo   Add --synthetic when no local camera is available.
+echo.
 echo Optional commands:
 echo   setup.bat --check       Environment check only
 echo   setup.bat --reinstall   Force dependency reinstall
 echo   setup.bat --no-models   Skip model download/check
 echo   setup.bat --no-pause    Exit without waiting for a key
-echo   setup.bat --kill-port   Kill non-backend process using port %PORT%
+echo   setup.bat --stop        Stop this project's backend on port %PORT%
+echo   setup.bat --kill-port   Kill a non-backend process using port %PORT%
 echo.
 if "%NO_PAUSE%"=="0" pause
 exit /b 0
@@ -268,7 +330,7 @@ if errorlevel 1 (
 exit /b 0
 
 :check_runtime_deps
-"%PY%" -c "import inspect, sys, fastapi, uvicorn, cv2, numpy, PIL, ultralytics, torch, mediapipe, dashscope, openai, dotenv, modelscope, clip, lap; from openai import OpenAI; c=OpenAI(api_key='dependency-check', base_url='https://dashscope.aliyuncs.com/compatible-mode/v1'); sig=str(inspect.signature(c.chat.completions.create)); bad=(sys.prefix == sys.base_prefix or not (ultralytics.__version__ == '8.4.88') or 'modalities' not in sig or 'audio' not in sig); raise SystemExit(1 if bad else 0)" >nul 2>nul
+"%PY%" -c "import inspect, sys, fastapi, uvicorn, websockets, cv2, numpy, PIL, ultralytics, torch, mediapipe, dashscope, openai, dotenv, modelscope, clip, lap, sounddevice; from openai import OpenAI; c=OpenAI(api_key='dependency-check', base_url='https://dashscope.aliyuncs.com/compatible-mode/v1'); sig=str(inspect.signature(c.chat.completions.create)); bad=(sys.prefix == sys.base_prefix or not (ultralytics.__version__ == '8.4.88') or 'modalities' not in sig or 'audio' not in sig); raise SystemExit(1 if bad else 0)" >nul 2>nul
 exit /b %ERRORLEVEL%
 
 :ensure_runtime_files
@@ -338,34 +400,43 @@ exit /b 0
 :start_backend
 echo.
 echo [7/7] Starting backend...
+call :stop_our_backend
+if errorlevel 1 exit /b 1
 call :get_port_pid
 if defined PORT_PID (
     call :is_our_backend
     if not errorlevel 1 (
-        echo [OK] Port %PORT% is already used by this backend. PID: %PORT_PID%
-        echo [INFO] Reusing the running backend/process.
-        start "" "http://127.0.0.1:%PORT%/"
-        exit /b 0
-    )
-
-    echo [ERROR] Port %PORT% is already used by another process.
-    call :describe_port_owner
-    if "%KILL_PORT%"=="1" (
-        echo [RUN] Killing PID %PORT_PID% because --kill-port was provided...
-        taskkill /PID %PORT_PID% /F
+        echo [RUN] Port %PORT% is still held by this project's backend. Killing PID %PORT_PID%...
+        taskkill /PID %PORT_PID% /T /F
         if errorlevel 1 exit /b 1
         timeout /t 2 /nobreak >nul
         call :get_port_pid
         if defined PORT_PID (
-            echo [ERROR] Port %PORT% is still busy after taskkill.
+            echo [ERROR] Port %PORT% is still busy after stopping the backend.
             call :describe_port_owner
             exit /b 1
         )
     ) else (
-        echo.
-        echo Close the process above, or run:
-        echo   setup.bat --kill-port
-        exit /b 1
+        echo [ERROR] Port %PORT% is already used by another process.
+        call :describe_port_owner
+        if "%KILL_PORT%"=="1" (
+            echo [RUN] Killing PID %PORT_PID% because --kill-port was provided...
+            taskkill /PID %PORT_PID% /T /F
+            if errorlevel 1 exit /b 1
+            timeout /t 2 /nobreak >nul
+            call :get_port_pid
+            if defined PORT_PID (
+                echo [ERROR] Port %PORT% is still busy after taskkill.
+                call :describe_port_owner
+                exit /b 1
+            )
+        ) else (
+            echo.
+            echo Close the process above, or run:
+            echo   setup.bat --kill-port
+            echo   setup.bat --stop
+            exit /b 1
+        )
     )
 )
 
@@ -419,7 +490,11 @@ exit /b 0
 
 :is_our_backend
 if not defined PORT_PID exit /b 1
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$expected=[regex]::Escape((Join-Path -Path (Resolve-Path -LiteralPath '%CD%') -ChildPath 'app_main.py')); $p=Get-CimInstance Win32_Process -Filter 'ProcessId=%PORT_PID%' -ErrorAction SilentlyContinue; if($p -and $p.CommandLine -match $expected){exit 0}else{exit 1}" >nul 2>nul
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$root=(Resolve-Path -LiteralPath '%CD%').Path; $p=Get-CimInstance Win32_Process -Filter 'ProcessId=%PORT_PID%' -ErrorAction SilentlyContinue; if(-not $p){exit 1}; $n=[string]$p.CommandLine; if(-not $n){exit 1}; $n=$n.ToLower() -replace '/','\'; $r=$root.ToLower() -replace '/','\'; if($n.Contains($r + '\app_main.py')){exit 0}; if($n.Contains($r + '\aiglasses\app_main.py')){exit 0}; if($n -match 'aiglasses\.app_main'){exit 0}; exit 1" >nul 2>nul
+exit /b %ERRORLEVEL%
+
+:stop_our_backend
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$root=(Resolve-Path -LiteralPath '%CD%').Path; $port=%PORT%; function Test-Our($cmd){ if(-not $cmd){ return $false }; $n=([string]$cmd).ToLower() -replace '/','\'; $r=$root.ToLower() -replace '/','\'; if($n.Contains($r + '\app_main.py')){ return $true }; if($n.Contains($r + '\aiglasses\app_main.py')){ return $true }; if($n -match 'aiglasses\.app_main'){ return $true }; return $false }; $all=@(); foreach($p in Get-CimInstance Win32_Process){ if(Test-Our $p.CommandLine){ $all += $p } }; $c=Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; if($c){ $lp=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $c.OwningProcess) -ErrorAction SilentlyContinue; if($lp -and (Test-Our $lp.CommandLine)){ $exists=$false; foreach($p in $all){ if($p.ProcessId -eq $lp.ProcessId){ $exists=$true; break } }; if(-not $exists){ $all += $lp } } }; if($all.Count -eq 0){ Write-Host '[INFO] No project backend is running.'; exit 0 }; $ids=@{}; foreach($p in $all){ $ids[$p.ProcessId]=$true }; foreach($p in $all){ if(-not $ids.ContainsKey($p.ParentProcessId)){ Write-Host ('[RUN] Stopping backend PID ' + $p.ProcessId + ' (process tree)'); cmd /c ('taskkill /PID ' + $p.ProcessId + ' /T /F') | Out-Host } }; $deadline=(Get-Date).AddSeconds(10); do { Start-Sleep -Milliseconds 400; $left=@(); foreach($p in Get-CimInstance Win32_Process){ if(Test-Our $p.CommandLine){ $left += $p } }; if($left.Count -eq 0){ Write-Host '[OK] Previous backend stopped.'; exit 0 } } while((Get-Date) -lt $deadline); Write-Host '[ERROR] Backend did not exit in time.'; foreach($p in $left){ Write-Host ('  still running PID ' + $p.ProcessId + ': ' + $p.CommandLine) }; exit 1"
 exit /b %ERRORLEVEL%
 
 :describe_port_owner

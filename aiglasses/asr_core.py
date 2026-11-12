@@ -1,7 +1,9 @@
 # asr_core.py
 # -*- coding: utf-8 -*-
-import os, json, asyncio
+import os, json, asyncio, time
 from typing import Any, Dict, List, Optional, Callable, Tuple
+
+from . import wake_gate
 
 ASR_DEBUG_RAW = os.getenv("ASR_DEBUG_RAW", "0") == "1"
 
@@ -179,9 +181,67 @@ class ASRCallback:
         except Exception:
             pass
 
-        # ---------- ③ final：仅 final 驱动 LLM（若未在播报） ----------
+        # ---------- ③ final：唤醒门 + 仅 final 驱动 LLM（若未在播报） ----------
         if is_end is True:
             final_text = text
+
+            # ③-a 唤醒词：休眠时唯一放行入口
+            if wake_gate.is_wake_phrase(final_text):
+                wake_gate.activate()
+                command_part = wake_gate.extract_command_after_wake(final_text)
+                print(f"[WAKE] '{final_text}' -> 激活，剩余指令='{command_part}'", flush=True)
+                if command_part:
+                    # 唤醒词和指令在同一句：“你好智能助手，帮我找手机”
+                    async def _run_wake_cmd():
+                        async with self._interrupt_lock:
+                            await self._start_ai(command_part)
+                    try:
+                        self._post(self._ui_final(final_text))
+                        self._post(_run_wake_cmd())
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        self._post(self._ui_final("[系统] 已唤醒，请讲（15 秒内有效）"))
+                    except Exception:
+                        pass
+                self._last_partial_for_ui = ""
+                self._last_final_text = ""
+                self._hot_interrupted = False
+                return
+
+            # ③-b 休眠：功能指令直接放行；闲聊仍需唤醒
+            if not wake_gate.is_active():
+                if wake_gate.is_always_on_command(final_text):
+                    wake_gate.activate()
+                    print(f"[WAKE] 休眠中放行功能指令: '{_shorten(final_text)}'", flush=True)
+                    async def _run_sleep_cmd():
+                        async with self._interrupt_lock:
+                            await self._start_ai(final_text)
+                    try:
+                        self._post(self._ui_final(final_text))
+                        self._post(_run_sleep_cmd())
+                    except Exception:
+                        pass
+                    self._last_partial_for_ui = ""
+                    self._last_final_text = ""
+                    self._hot_interrupted = False
+                    return
+                now_ts = time.time()
+                if now_ts - getattr(self, "_last_sleep_hint", 0.0) > 30.0:
+                    self._last_sleep_hint = now_ts
+                    try:
+                        print(f"[WAKE] 休眠中忽略: '{_shorten(final_text)}'", flush=True)
+                        self._post(self._ui_final("[系统] 助手休眠中，说“你好，智能助手”唤醒"))
+                    except Exception:
+                        pass
+                self._last_partial_for_ui = ""
+                self._last_final_text = ""
+                self._hot_interrupted = False
+                return
+
+            # ③-c 激活中：本次交互刷新窗口
+            wake_gate.touch()
             try:
                 print(f"[ASR FINAL]  len={len(final_text)} text='{final_text}'", flush=True)
                 self._post(self._ui_final(final_text))

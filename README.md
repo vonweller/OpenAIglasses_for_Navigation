@@ -14,6 +14,7 @@
 
 如果你想快速知道“这个项目有哪些功能、每个功能怎么触发、盲道/过马路/红绿灯/找物品怎么测试”，请先看：
 
+- [AI 开发交接文档](docs/AI_DEVELOPMENT_HANDOFF.md)：新 AI / 新电脑接手、电脑 IP 与 Wi-Fi 变更、K230 私有配置更新、部署回退、已知问题
 - [FUNCTION_FRAMEWORK.md](FUNCTION_FRAMEWORK.md)：功能框架、语音命令、触发链路、测试步骤
 
 常用语音命令摘要：
