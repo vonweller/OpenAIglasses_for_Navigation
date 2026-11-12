@@ -28,8 +28,6 @@ const char* WIFI_PASS   = "lyt13509018386";
 String SERVER_HOST = "auto";
 const uint16_t SERVER_PORT = 8081;
 volatile bool server_resolved = false;
-const uint16_t SERVER_PORT = 8081;
-volatile bool server_resolved = false;
 
 static const char* CAM_WS_PATH = "/ws/camera";
 static const char* AUD_WS_PATH = "/ws_audio";
@@ -384,11 +382,13 @@ void taskCamSend(void*) {
         const size_t jpeg_len = fb->len;
         last_jpeg_size = jpeg_len;
 
-        // 上一帧发送已超过 150ms 说明链路拥塞：丢弃本帧，优先把缓冲还给相机
-        if (s_last_send_ms >= 150) {
+        // 上一帧发送耗时过长说明链路拥塞：丢弃本帧，优先把缓冲还给相机。
+        // 【合并调优】OV2640+ArduinoWebsockets 整帧同步发送常态 130~250ms，
+        // 原阈值 150ms 会把几乎每帧都丢掉（实测 dropped 1300+）；放宽到 400ms。
+        if (s_last_send_ms >= 400) {
           esp_camera_fb_return(fb);
           frame_dropped_count++;
-          s_last_send_ms = 75; // 下一帧再试，避免连续丢
+          s_last_send_ms = 150; // 下一帧再试，避免连续丢
           continue;
         }
 
@@ -1304,6 +1304,7 @@ static inline bool retry_due(unsigned long now, unsigned long deadline) {
 }
 
 void loop() {
+  unsigned long now = millis();   // 【合并】now 提前声明，供发现逻辑与重试计时共用
   // 【合并-自动发现】先发现服务器，再走原有重试机制连接两路 WS
   if (!server_resolved) {
     if (!discover_server(3000)) { delay(50); return; }
@@ -1312,7 +1313,6 @@ void loop() {
   }
 
   static bool wifi_was_connected = false;
-  unsigned long now = millis();
   bool wifi_connected = WiFi.status() == WL_CONNECTED;
 
   if (!wifi_connected) {
