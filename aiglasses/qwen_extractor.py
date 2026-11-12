@@ -127,7 +127,7 @@ def extract_english_label(query_cn: str) -> Tuple[str, str]:
             {"role": "user",   "content": q or query_cn.strip()},
         ]
         rsp = client.chat.completions.create(
-            model=os.getenv("QWEN_MODEL", "qwen-turbo"),
+            model=os.getenv("QWEN_LABEL_MODEL") or os.getenv("QWEN_MODEL", "qwen-turbo"),
             messages=msgs,
             stream=False
         )

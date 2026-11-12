@@ -458,8 +458,8 @@
     <div class="canvas-wrap"><canvas id="canvas"></canvas></div>
     <div id="stageEmpty" class="stage-empty">
       <div class="stage-dot"></div>
-      <strong>等待摄像头设备</strong>
-      <span>后端已运行，ESP32 摄像头尚未接入</span>
+      <strong id="stageEmptyTitle">等待摄像头设备</strong>
+      <span id="stageEmptySub">后端已运行，ESP32 摄像头尚未接入</span>
     </div>
     <div class="stage-status">
       <span id="camStatusStage" class="badge warn">Camera HW: waiting</span>
@@ -587,6 +587,6 @@
 }</script>
 
 <!-- 主脚本 -->
-<script type="module" src="/static/main.js?v=20260617-layout1"></script>
+<script type="module" src="/static/main.js?v=20261112-fix1"></script>
 </body>
 </html>

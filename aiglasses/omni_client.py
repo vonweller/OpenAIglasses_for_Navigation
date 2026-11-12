@@ -8,7 +8,15 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 from openai import OpenAI
 
 API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
-QWEN_MODEL = "qwen-omni-turbo"
+# 【修复】qwen-omni-turbo 已下线（404 Model not exist，2026）。
+# qwen3-omni-flash 实测兼容 chat.completions + modalities=["text","audio"] + voice=Cherry。
+# 可用环境变量 QWEN_MODEL / DASHSCOPE_QWEN_MODEL / OMNI_MODEL 覆盖。
+QWEN_MODEL = (
+    os.getenv("QWEN_MODEL")
+    or os.getenv("DASHSCOPE_QWEN_MODEL")
+    or os.getenv("OMNI_MODEL")
+    or "qwen3-omni-flash"
+)
 
 oai_client = OpenAI(
     api_key=API_KEY or "missing-key",

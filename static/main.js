@@ -11,6 +11,8 @@
   const $modeStatus = document.getElementById('modeStatus');
   const $speakerStatus = document.getElementById('speakerStatus');
   const $stageEmpty = document.getElementById('stageEmpty');
+  const $stageEmptyTitle = document.getElementById('stageEmptyTitle');
+  const $stageEmptySub = document.getElementById('stageEmptySub');
   const $partial   = document.getElementById('partial');
   const $finalList = document.getElementById('finalList');
   const $btnClear  = document.getElementById('btnClear');
@@ -295,6 +297,29 @@
   window.addEventListener('resize', fitCanvas); fitCanvas();
 
   let wsCam, wsUI, frames = 0, fpsTimer = 0, lastFrameAt = 0;
+  // 【修复】断线自动重连：旧版 WS 断开后永不重连，页面会一直黑屏
+  let camRetryTimer = null, camRetryDelay = 1200;
+  let uiRetryTimer = null, uiRetryDelay = 1200;
+  function scheduleCamReconnect(){
+    if (camRetryTimer) return;
+    camRetryTimer = setTimeout(() => {
+      camRetryTimer = null;
+      camRetryDelay = Math.min(camRetryDelay * 1.6, 10000);
+      connectCamera();
+    }, camRetryDelay);
+  }
+  function scheduleUIReconnect(){
+    if (uiRetryTimer) return;
+    uiRetryTimer = setTimeout(() => {
+      uiRetryTimer = null;
+      uiRetryDelay = Math.min(uiRetryDelay * 1.6, 10000);
+      connectASR();
+    }, uiRetryDelay);
+  }
+  function setStageEmpty(title, sub){
+    if ($stageEmptyTitle && title != null) $stageEmptyTitle.textContent = title;
+    if ($stageEmptySub && sub != null) $stageEmptySub.textContent = sub;
+  }
 
   function drawBlob(buf){
     lastFrameAt = Date.now();
@@ -325,8 +350,8 @@
     wsCam = new WebSocket(`${proto}://${location.host}/ws/viewer`);
     setBadge($camStatus, false, 'Viewer: connecting…', 'warn');
     wsCam.binaryType = 'arraybuffer';
-    wsCam.onopen  = ()=> setBadge($camStatus, true, 'Viewer: online');
-    wsCam.onclose = ()=> setBadge($camStatus, false, 'Viewer: offline');
+    wsCam.onopen  = ()=> { camRetryDelay = 1200; setBadge($camStatus, true, 'Viewer: online'); };
+    wsCam.onclose = ()=> { setBadge($camStatus, false, 'Viewer: offline · 重连中…'); scheduleCamReconnect(); };
     wsCam.onerror = ()=> setBadge($camStatus, false, 'Viewer: error');
     wsCam.onmessage = (ev)=> drawBlob(ev.data);
   }
@@ -336,8 +361,8 @@
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     wsUI = new WebSocket(`${proto}://${location.host}/ws_ui`);
     setBadge($asrStatus, false, 'UI: connecting…', 'warn');
-    wsUI.onopen  = ()=> setBadge($asrStatus, true, 'UI: online');
-    wsUI.onclose = ()=> setBadge($asrStatus, false, 'UI: offline');
+    wsUI.onopen  = ()=> { uiRetryDelay = 1200; setBadge($asrStatus, true, 'UI: online'); };
+    wsUI.onclose = ()=> { setBadge($asrStatus, false, 'UI: offline · 重连中…'); scheduleUIReconnect(); };
     wsUI.onerror = ()=> setBadge($asrStatus, false, 'UI: error');
     wsUI.onmessage = (ev)=>{
       const s = ev.data || '';
@@ -499,12 +524,30 @@
       if (!res.ok) throw new Error(String(res.status));
       const data = await res.json();
 
+      const lastFrameAge = Number(data.last_frame_age_sec);
       if (data.camera_connected) {
-        setBadge($camStatusStage, true, 'Camera HW: connected');
+        const framesStale = !Number.isFinite(lastFrameAge) || lastFrameAge > 3;
+        if (framesStale) {
+          // 【修复】已连接但收不到帧：明确提示，而不是永远显示“等待摄像头设备”
+          setBadge($camStatusStage, false, 'Camera HW: connected · no frames', 'warn');
+          if (!lastFrameAt || Date.now() - lastFrameAt > 2500) {
+            if ($stageEmpty) $stageEmpty.classList.remove('is-hidden');
+            setStageEmpty(
+              '眼镜已连接 · 尚未收到画面帧',
+              Number.isFinite(lastFrameAge)
+                ? '最后画面 ' + lastFrameAge.toFixed(1) + ' 秒前 · 正在等待设备推流…'
+                : '正在等待设备推流…（长时间无画面请重启眼镜端）'
+            );
+            $fps.textContent = 'FPS: --';
+          }
+        } else {
+          setBadge($camStatusStage, true, 'Camera HW: connected');
+        }
       } else {
         setBadge($camStatusStage, false, 'Camera HW: waiting', 'warn');
         if (!lastFrameAt || Date.now() - lastFrameAt > 2500) {
           if ($stageEmpty) $stageEmpty.classList.remove('is-hidden');
+          setStageEmpty('等待摄像头设备', '后端已运行，ESP32 摄像头尚未接入');
           $fps.textContent = 'FPS: --';
         }
       }

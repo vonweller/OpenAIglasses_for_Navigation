@@ -989,8 +989,12 @@ async def ws_ui(ws: WebSocket):
         init = {"partial": current_partial, "finals": recent_finals[-10:]}
         await ws.send_text("INIT:" + json.dumps(init, ensure_ascii=False))
         while True:
-            await asyncio.sleep(60)
+            msg = await ws.receive()
+            if msg.get("type") in ("websocket.disconnect", "websocket.close"):
+                break
     except WebSocketDisconnect:
+        pass
+    except Exception:
         pass
     finally:
         ui_clients.pop(id(ws), None)
@@ -1161,12 +1165,22 @@ async def ws_audio(ws: WebSocket):
 @app.websocket("/ws/camera")
 async def ws_camera_esp(ws: WebSocket):
     global esp32_camera_ws, blind_path_navigator, cross_street_navigator, cross_street_active, navigation_active, orchestrator
-    if esp32_camera_ws is not None:
-        await ws.close(code=1013)
-        return
-    esp32_camera_ws = ws
+    # 【修复】last-wins：先接受新连接，再踢掉旧连接。
+    # 旧逻辑“槽位被占就在 accept 前 close(1013)”，uvicorn 会把它变成 HTTP 403；
+    # 眼镜 WiFi 一抖留下的僵尸连接长期占坑，设备后续所有重连都被 403 顶回，
+    # 表现为“眼镜已连接但页面永远黑屏”。现在永远优先接受最新设备。
     await ws.accept()
-    print("[CAMERA] ESP32 connected")
+    old_ws = esp32_camera_ws
+    if old_ws is not None and old_ws is not ws:
+        print("[CAMERA] 新相机连接接入，踢掉旧连接（last-wins）", flush=True)
+        try:
+            if WebSocketState is None or old_ws.client_state == WebSocketState.CONNECTED:
+                await old_ws.close(code=4000, reason="replaced by newer camera client")
+        except Exception:
+            pass
+        esp32_camera_ws = None
+    esp32_camera_ws = ws
+    print("[CAMERA] ESP32 connected", flush=True)
     
     # 【新增】初始化盲道导航器
     if blind_path_navigator is None and yolo_seg_model is not None:
@@ -1203,13 +1217,36 @@ async def ws_camera_esp(ws: WebSocket):
         orchestrator = NavigationMaster(blind_path_navigator, cross_street_navigator)
         print("[NAV MASTER] 统领状态机已初始化（托管模式）")
     frame_counter = 0  # 添加帧计数器
+    # 【修复】无帧看门狗：长时间收不到画面帧就主动断开释放槽位，
+    # 配合 last-wins 让设备重连永远能成功，避免僵尸连接把页面卡死。
+    CAMERA_FIRST_FRAME_TIMEOUT = float(os.getenv("AIGLASS_CAM_FIRST_FRAME_TIMEOUT", "30"))
+    CAMERA_IDLE_TIMEOUT = float(os.getenv("AIGLASS_CAM_IDLE_TIMEOUT", "30"))
+    first_frame_seen = False
+    last_frame_mono = time.monotonic()
     
     try:
         while True:
-            msg = await ws.receive()
+            _timeout = CAMERA_FIRST_FRAME_TIMEOUT if not first_frame_seen else CAMERA_IDLE_TIMEOUT
+            try:
+                msg = await asyncio.wait_for(ws.receive(), timeout=_timeout)
+            except asyncio.TimeoutError:
+                _idle = time.monotonic() - last_frame_mono
+                print(f"[CAMERA] watchdog: 已连接但 {_idle:.0f}s 未收到画面帧，主动断开释放槽位（等待眼镜重连）", flush=True)
+                try:
+                    if WebSocketState is None or ws.client_state == WebSocketState.CONNECTED:
+                        await ws.close(code=1001, reason="no frames watchdog")
+                except Exception:
+                    pass
+                break
+            if "text" in msg and msg["text"] is not None:
+                # 【修复】打印设备端文本遥测（HELLO/STAT），不再静默丢弃
+                print(f"[CAMERA][device] {str(msg['text'])[:200]}", flush=True)
+                continue
             if "bytes" in msg and msg["bytes"] is not None:
                 data = msg["bytes"]
                 frame_counter += 1
+                first_frame_seen = True
+                last_frame_mono = time.monotonic()
                 
                 # 【新增】录制原始帧
                 try:
@@ -1345,7 +1382,7 @@ async def ws_camera_esp(ws: WebSocket):
         except Exception:
             pass
         esp32_camera_ws = None
-        print("[CAMERA] ESP32 disconnected")
+        print(f"[CAMERA] ESP32 disconnected (共收到 {frame_counter} 帧)", flush=True)
         
         # 【新增】清理导航状态
         if blind_path_navigator:
@@ -1363,16 +1400,17 @@ async def ws_viewer(ws: WebSocket):
     camera_viewers.add(ws)
     print(f"[VIEWER] Browser connected. Total viewers: {len(camera_viewers)}", flush=True)
     try:
+        # 【修复】receive() 代替 sleep(60)：断线立即可感知并清理
         while True:
-            # 保持连接活跃
-            await asyncio.sleep(60)
+            msg = await ws.receive()
+            if msg.get("type") in ("websocket.disconnect", "websocket.close"):
+                break
     except WebSocketDisconnect:
-        print("[VIEWER] Browser disconnected", flush=True)
+        pass
+    except Exception:
+        pass
     finally:
-        try: 
-            camera_viewers.remove(ws)
-        except Exception: 
-            pass
+        camera_viewers.discard(ws)
         print(f"[VIEWER] Removed. Total viewers: {len(camera_viewers)}", flush=True)
 
 # ---------- WebSocket：浏览器订阅 IMU ----------
@@ -1382,8 +1420,12 @@ async def ws_imu(ws: WebSocket):
     imu_ws_clients.add(ws)
     try:
         while True:
-            await asyncio.sleep(60)
+            msg = await ws.receive()
+            if msg.get("type") in ("websocket.disconnect", "websocket.close"):
+                break
     except WebSocketDisconnect:
+        pass
+    except Exception:
         pass
     finally:
         imu_ws_clients.discard(ws)
@@ -1513,12 +1555,28 @@ def process_imu_and_maybe_store(d: Dict[str, Any]):
         imu_store.append(item)
 
 # ---------- UDP 接收 IMU 并转发 ----------
+_udp_transport = None  # 【新增】保存 UDP transport，用于自动发现应答
+
 class UDPProto(asyncio.DatagramProtocol):
     def connection_made(self, transport):
-        print(f"[UDP] listening on {UDP_IP}:{UDP_PORT}")
+        global _udp_transport
+        _udp_transport = transport
+        print(f"[UDP] listening on {UDP_IP}:{UDP_PORT} (含设备自动发现 AIGLASS_DISCOVER)")
     def datagram_received(self, data, addr):
         try:
             s = data.decode('utf-8', errors='ignore').strip()
+            # 【新增】设备自动发现协议：收到广播 AIGLASS_DISCOVER 即单播回服务器地址。
+            # 眼镜端（ESP32/K230/K10）无需再硬编码服务器 IP，换 WiFi 也免改代码。
+            if s == "AIGLASS_DISCOVER":
+                http_port = int(os.getenv("AIGLASS_HTTP_PORT", "8081"))
+                reply = f"AIGLASS_SERVER:{http_port}"
+                try:
+                    if _udp_transport is not None:
+                        _udp_transport.sendto(reply.encode("utf-8"), addr)
+                    print(f"[DISCOVER] {addr[0]} -> 应答 {reply}", flush=True)
+                except Exception as exc:
+                    print(f"[DISCOVER] 应答失败 {addr}: {exc}", flush=True)
+                return
             d = json.loads(s)
             if 'ts' not in d and 'timestamp_ms' in d:
                 d['ts'] = d.pop('timestamp_ms')

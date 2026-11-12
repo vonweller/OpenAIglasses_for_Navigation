@@ -18,8 +18,13 @@ using namespace websockets;
 // ===== WiFi / Server =====
 const char* WIFI_SSID   = "LYT";
 const char* WIFI_PASS   = "lyt13509018386";
-const char* SERVER_HOST = "192.168.10.6";
+// 【新增】服务器地址自动发现：默认 "auto"。
+// 原理：连接 WiFi 后，向 255.255.255.255:12345 广播 "AIGLASS_DISCOVER"，
+//       后端收到后单播回 "AIGLASS_SERVER:<port>"，取其源 IP 即服务器地址。
+// 换 WiFi / 服务器 IP 变化都无需改代码；也可硬编码 IP 兼容旧行为。
+String SERVER_HOST = "auto";
 const uint16_t SERVER_PORT = 8081;
+volatile bool server_resolved = false;
 
 static const char* CAM_WS_PATH = "/ws/camera";
 static const char* AUD_WS_PATH = "/ws_audio";
@@ -29,6 +34,8 @@ static const char* AUD_WS_PATH = "/ws_audio";
 #include "camera_pins.h"
 
 framesize_t g_frame_size = FRAMESIZE_VGA;
+uint16_t g_sensor_pid = 0;   // 【诊断】传感器型号（OV2640=0x26 / OV3660=0x3660 / OV5640=0x5640）
+int g_fb_count_live = 0;     // 【修复】实际生效的 fb_count（降级后可能与编译配置不同）
 #define JPEG_QUALITY  17
 #define FB_COUNT      2
 volatile int g_target_fps = 0; // 0=不限速，>0 时按指定 FPS 限速发送
@@ -39,6 +46,7 @@ volatile unsigned long frame_sent_count = 0;      // 发送帧计数
 volatile unsigned long frame_dropped_count = 0;   // 丢弃帧计数
 volatile unsigned long last_stats_time = 0;       // 上次统计时间
 volatile unsigned long ws_send_fail_count = 0;    // WebSocket 发送失败计数
+volatile unsigned long ws_cam_opened_at = 0;      // 【修复】相机WS打开时刻（半开连接看门狗用）
 
 // ===== Mic (PDM RX) =====
 #define I2S_MIC_CLOCK_PIN 42
@@ -60,7 +68,7 @@ const int TTS_RATE = 16000;
 #define IMU_SPI_MOSI  2   // D1
 #define IMU_SPI_MISO  3   // D2
 #define IMU_SPI_CS    4   // D3
-const char* UDP_HOST  = SERVER_HOST; // IMU 数据发送到同一台后端服务器
+// IMU 数据发送到同一台后端服务器（自动发现后取 SERVER_HOST，见 taskImuLoop）
 const int   UDP_PORT  = 12345;
 
 WiFiUDP udp;
@@ -93,6 +101,27 @@ volatile bool run_audio_stream = false;
 // ====================================================================
 // Camera
 // ====================================================================
+bool init_camera() {
+  // 【修复】OV2640 帧缓冲分配降级阶梯：优先 PSRAM 双缓冲，失败逐级降级
+  struct TryCfg { framesize_t fs; int fb; bool psram; int xclk; } tries[] = {
+    { FRAMESIZE_VGA, 2, true,  20 },
+    { FRAMESIZE_VGA, 1, true,  20 },
+    { FRAMESIZE_VGA, 1, true,  16 },
+    { FRAMESIZE_QVGA, 1, true, 20 },
+    { FRAMESIZE_QVGA, 1, false, 20 },   // 最后兜底：内部RAM + QVGA，保底有画面
+  };
+  for (auto& c : tries) {
+    if (_init_camera_with(c.fs, c.fb, c.psram, c.xclk)) {
+      g_frame_size = c.fs;
+      g_fb_count_live = c.fb;
+      Serial.printf("[CAM] 生效配置: fs=%d fb=%d psram=%d\n", (int)c.fs, c.fb, c.psram?1:0);
+      return true;
+    }
+  }
+  Serial.println("[CAM] 所有配置均失败!");
+  return false;
+}
+
 bool apply_framesize(framesize_t fs) {
   sensor_t* s = esp_camera_sensor_get();
   if (!s) return false;
@@ -101,7 +130,7 @@ bool apply_framesize(framesize_t fs) {
   return false;
 }
 
-bool init_camera() {
+bool _init_camera_with(framesize_t fs, int fb_count, bool in_psram, int xclk_mhz) {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer   = LEDC_TIMER_0;
@@ -114,22 +143,37 @@ bool init_camera() {
   config.pin_sscb_sda = SIOD_GPIO_NUM; config.pin_sscb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn  = PWDN_GPIO_NUM; config.pin_reset = RESET_GPIO_NUM;
 
-  config.xclk_freq_hz = 20000000;
+  config.xclk_freq_hz = xclk_mhz * 1000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size   = g_frame_size;
+  config.frame_size   = fs;
   config.jpeg_quality = JPEG_QUALITY;
-  config.fb_count     = FB_COUNT;
-  config.fb_location  = CAMERA_FB_IN_PSRAM;
+  config.fb_count     = fb_count;
+  config.fb_location  = in_psram ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
   config.grab_mode    = CAMERA_GRAB_LATEST;
 
+  Serial.printf("[CAM] try fs=%d fb=%d psram=%d xclk=%dM ...", (int)fs, fb_count, in_psram ? 1 : 0, xclk_mhz);
   esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) { Serial.printf("[CAM] init failed: 0x%x\n", err); return false; }
+  if (err != ESP_OK) { Serial.printf(" FAILED 0x%x\n", err); return false; }
+  Serial.println(" OK");
+  // 校验帧缓冲确实拿到了（esp_camera_init 成功但 fb 分配异常时 fb_get 会一直 NULL）
+  {
+    camera_fb_t* probe = esp_camera_fb_get();
+    if (!probe) { Serial.println("[CAM] init OK 但 fb_get=NULL，弃用该配置"); esp_camera_deinit(); return false; }
+    Serial.printf("[CAM] probe帧 %u bytes, PSRAM=%u/free=%u\n", probe->len,
+                  (unsigned)ESP.getPsramSize(), (unsigned)ESP.getFreePsram());
+    esp_camera_fb_return(probe);
+  }
 
   delay(200);
   sensor_t * s = esp_camera_sensor_get();
   if (s) {
-    Serial.printf("[CAM] sensor PID=0x%04x MIDH=0x%02x MIDL=0x%02x VER=0x%02x\n",
-                  s->id.PID, s->id.MIDH, s->id.MIDL, s->id.VER);
+    g_sensor_pid = s->id.PID;
+    Serial.printf("[CAM] sensor PID=0x%04x MIDH=0x%02x MIDL=0x%02x VER=0x%02x PSRAM=%u bytes free=%u\n",
+                  s->id.PID, s->id.MIDH, s->id.MIDL, s->id.VER,
+                  (unsigned)ESP.getPsramSize(), (unsigned)ESP.getFreePsram());
+    if (ESP.getPsramSize() == 0) {
+      Serial.println("[CAM] !!! PSRAM 未启用：请用 PSRAM=OPI 选项编译烧录，否则 VGA 帧缓冲分配失败、无画面 !!!");
+    }
 
     s->set_hmirror(s, 1);
     s->set_vflip(s, 0);
@@ -175,13 +219,21 @@ inline void enqueue_frame(camera_fb_t* fb) {
 void taskCamCapture(void*) {
   unsigned long last_log = 0;
   unsigned long capture_fail_count = 0;
+  uint32_t consec_fb_fail = 0;   // 【修复】连续采集失败计数（自愈用）
   
+  bool cam_ok = (g_fb_count_live > 0);
   for(;;){
     if (snapshot_in_progress) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
     
+    if (!cam_ok) {   // 【修复】初始化失败的后台重试
+      vTaskDelay(pdMS_TO_TICKS(5000));
+      cam_ok = init_camera();
+      continue;
+    }
     if (cam_ws_ready) {
       camera_fb_t* fb = esp_camera_fb_get();
       if (fb) {
+        consec_fb_fail = 0;
         frame_captured_count++;
         if (fb->format != PIXFORMAT_JPEG) { 
           esp_camera_fb_return(fb);
@@ -192,6 +244,17 @@ void taskCamCapture(void*) {
         }
       } else {
         capture_fail_count++;
+        // 【修复】esp_camera_fb_get 连续失败（PSRAM/传感器异常）时自愈：
+        // 清空帧队列 -> 反初始化 -> 重新初始化摄像头
+        if (++consec_fb_fail >= 300) {
+          consec_fb_fail = 0;
+          Serial.println("[CAM] fb_get 连续失败，重新初始化摄像头...");
+          fb_ptr_t d = nullptr;
+          while (xQueueReceive(qFrames, &d, 0) == pdPASS) { if (d) esp_camera_fb_return(d); }
+          esp_camera_deinit();
+          cam_ok = init_camera();   // 失败则进入后台重试节奏
+          vTaskDelay(pdMS_TO_TICKS(100));
+        }
         vTaskDelay(pdMS_TO_TICKS(2));
       }
       
@@ -265,11 +328,32 @@ void taskCamSend(void*) {
         esp_camera_fb_return(fb); 
       }
     } else {
-      // 队列接收超时，检查是否长时间没有帧
+      // 队列接收超时：上报遥测 + 检查是否长时间没有帧
       unsigned long now = millis();
+      if (now - last_log > 5000) {
+        last_log = now;
+        if (cam_ws_ready) {
+          // 【修复】STAT 遥测：服务端日志直接可见采集/发送计数，远程即可判断眼镜端状态
+          char stat[192];
+          snprintf(stat, sizeof(stat),
+                   "STAT:{\"captured\":%lu,\"sent\":%lu,\"dropped\":%lu,\"ws_fail\":%lu,\"free_heap\":%u,\"target_fps\":%d,\"psram\":%u,\"psram_free\":%u,\"pid\":%04x}",
+                   frame_captured_count, frame_sent_count, frame_dropped_count, ws_send_fail_count,
+                   (unsigned)ESP.getFreeHeap(), g_target_fps,
+                   (unsigned)ESP.getPsramSize(), (unsigned)ESP.getFreePsram(), g_sensor_pid);
+          wsCam.send(stat);
+        }
+        Serial.printf("[CAM-SEND] sent=%lu, dropped=%lu, ws_fail=%lu, captured=%lu" "\n",
+                      frame_sent_count, frame_dropped_count, ws_send_fail_count, frame_captured_count);
+      }
       if (cam_ws_ready && last_sent_time > 0 && (now - last_sent_time) > 3000) {
         Serial.printf("[CAM-SEND] WARNING: No frame sent for %lu ms\n", now - last_sent_time);
         send_timeout_count++;
+      }
+      // 【修复】半开连接看门狗：连接建立 15s 且一帧未发，主动断开触发重连
+      if (cam_ws_ready && frame_sent_count == 0 && ws_cam_opened_at > 0 &&
+          (millis() - ws_cam_opened_at) > 15000) {
+        Serial.println("[CAM-SEND] watchdog: 15s未发出任何帧，断开重连");
+        wsCam.close();
       }
     }
   }
@@ -564,7 +648,7 @@ void taskHttpPlay(void*){
   while (http_play_running) {
     if (!cli.connected()) {
       Serial.println("[AUDIO] HTTP connect...");
-      if (!cli.connect(SERVER_HOST, SERVER_PORT)) { delay(500); continue; }
+      if (!cli.connect(SERVER_HOST.c_str(), SERVER_PORT)) { delay(500); continue; }
       String req =
         String("GET /stream.wav HTTP/1.1\r\n") +
         "Host: " + SERVER_HOST + ":" + String(SERVER_PORT) + "\r\n" +
@@ -864,7 +948,8 @@ void taskImuLoop(void*){
       ts, tempC, ax_f, ay_f, az_f, gx, gy, gz);
 
     if (n > 0) {
-      udp.beginPacket(UDP_HOST, UDP_PORT);
+      if (!server_resolved) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }   // 【新增】等服务器发现
+      udp.beginPacket(SERVER_HOST.c_str(), UDP_PORT);
       udp.write((const uint8_t*)buf, n);
       udp.endPacket();
     }
@@ -875,6 +960,45 @@ void taskImuLoop(void*){
 // ====================================================================
 // Setup / Loop
 // ====================================================================
+
+// ====================================================================
+// 服务器自动发现（UDP 广播 255.255.255.255:12345）
+// ====================================================================
+bool discover_server(uint32_t timeout_ms = 4000) {
+  if (SERVER_HOST != "auto") { server_resolved = true; return true; }  // 手写 IP 模式
+  WiFiUDP d;
+  d.begin(12346);
+  const char* magic = "AIGLASS_DISCOVER";
+  uint32_t t0 = millis();
+  int attempts = 0;
+  while (millis() - t0 < timeout_ms) {
+    if (attempts++ % 10 == 0) {
+      d.beginPacket(IPAddress(255,255,255,255), 12345);
+      d.write((const uint8_t*)magic, strlen(magic));
+      d.endPacket();
+      Serial.println("[DISCOVER] 广播 AIGLASS_DISCOVER ...");
+    }
+    int pkt = d.parsePacket();
+    if (pkt > 0) {
+      String resp = d.readStringUntil('\0');
+      resp.trim();
+      IPAddress peer = d.remoteIP();
+      Serial.printf("[DISCOVER] 收到 \"%s\" from %s\n", resp.c_str(), peer.toString().c_str());
+      if (resp.startsWith("AIGLASS_SERVER:")) {
+        SERVER_HOST = peer.toString();
+        server_resolved = true;
+        Serial.printf("[DISCOVER] 服务器 = %s:%u\n", SERVER_HOST.c_str(), (unsigned)SERVER_PORT);
+        d.stop();
+        return true;
+      }
+    }
+    delay(120);
+  }
+  d.stop();
+  Serial.println("[DISCOVER] 超时未发现服务器，稍后重试");
+  return false;
+}
+
 void setup() {
   Serial.begin(115200);
   delay(300);
@@ -890,7 +1014,10 @@ void setup() {
   while (WiFi.status()!=WL_CONNECTED){ delay(300); Serial.print("."); }
   Serial.println(" OK " + WiFi.localIP().toString());
 
-  if (!init_camera()) { Serial.println("[CAM] init failed, reboot..."); delay(1500); esp_restart(); }
+  discover_server(4000);   // 【新增】自动发现服务器（失败则在 loop 里持续重试）
+
+  // 【修复】摄像头初始化失败不再 esp_restart 死循环，改为后台重试
+  if (!init_camera()) { Serial.println("[CAM] init failed, 5s 后重试..."); }
 
   udp.begin(0);
 
@@ -912,6 +1039,8 @@ void setup() {
     if (ev == WebsocketsEvent::ConnectionOpened)  { 
       cam_ws_ready = true;  
       Serial.println("[WS-CAM] open");
+      ws_cam_opened_at = millis();
+      wsCam.send("HELLO:XIAO-ESP32S3-fw2.5");   // 【修复】自报身份，服务端日志可见
       // 重置统计
       frame_sent_count = 0;
       frame_dropped_count = 0;
@@ -1005,14 +1134,15 @@ void setup() {
 }
 
 void loop() {
+  if (!server_resolved && !discover_server(3000)) { return; }   // 【新增】先发现再连接
   if (!wsCam.available()) {
-    if (wsCam.connect(SERVER_HOST, SERVER_PORT, CAM_WS_PATH)) {
+    if (wsCam.connect(SERVER_HOST.c_str(), SERVER_PORT, CAM_WS_PATH)) {
       Serial.println("[WS-CAM] connected");
     } else { Serial.println("[WS-CAM] retry in 1s..."); delay(1000); }
   }
 
   if (!wsAud.available()) {
-    if (wsAud.connect(SERVER_HOST, SERVER_PORT, AUD_WS_PATH)) {
+    if (wsAud.connect(SERVER_HOST.c_str(), SERVER_PORT, AUD_WS_PATH)) {
       Serial.println("[WS-AUD] connected");
       delay(50);
       run_audio_stream = true;
