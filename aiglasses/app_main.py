@@ -1730,8 +1730,10 @@ async def ws_camera_esp(ws: WebSocket):
     frame_counter = 0  # 添加帧计数器
     # 【修复】无帧看门狗：长时间收不到画面帧就主动断开释放槽位，
     # 配合 last-wins 让设备重连永远能成功，避免僵尸连接把页面卡死。
+    # 【调优】首帧 30s / 后续 60s：WiFi 波动下发送端可能长时间阻塞，
+    # 30s 会误杀慢链路；放宽到 60s 仍能兜底真正的僵尸连接。
     CAMERA_FIRST_FRAME_TIMEOUT = float(os.getenv("AIGLASS_CAM_FIRST_FRAME_TIMEOUT", "30"))
-    CAMERA_IDLE_TIMEOUT = float(os.getenv("AIGLASS_CAM_IDLE_TIMEOUT", "30"))
+    CAMERA_IDLE_TIMEOUT = float(os.getenv("AIGLASS_CAM_IDLE_TIMEOUT", "60"))
     first_frame_seen = False
     last_frame_mono = time.monotonic()
     
