@@ -16,8 +16,9 @@
 using namespace websockets;
 
 // ===== WiFi（改成你的 2.4G WiFi；服务器地址不需要填——自动发现）=====
-const char* WIFI_SSID = "LYT";
-const char* WIFI_PASS = "lyt13509018386";
+// 烧录前改成你自己的 2.4G WiFi（真实密码不要提交进 Git）
+const char* WIFI_SSID = "YOUR_2_4_GHZ_WIFI";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
 
 String SERVER_HOST = "auto";
 const uint16_t SERVER_PORT = 8081;
