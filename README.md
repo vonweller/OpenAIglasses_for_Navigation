@@ -83,6 +83,19 @@
 - **状态面板**：显示导航状态、检测信息、FPS 等
 - **中文友好**：所有界面和语音使用中文，支持自定义字体
 
+
+## 🔄 设备端自动发现（免改 IP）
+
+从 2026-11 起，设备端固件默认 `SERVER_HOST = "auto"`：
+
+1. 设备连上 WiFi 后向 `255.255.255.255:12345` 广播 `AIGLASS_DISCOVER`
+2. 后端收到后单播应答 `AIGLASS_SERVER:<port>`
+3. 设备取应答包源 IP 作为服务器地址并连接 `/ws/camera` 与 `/ws_audio`
+
+**换 WiFi / 电脑 IP 变化都不再需要改设备代码。** 已实现端：XIAO ESP32S3（compile/compile.ino）、行空板 K10（k10_glasses/）。K230 端见 firmware/k230/（其配置在板上 k230_secrets.py）。
+
+诊断：后端日志会打印 `[DISCOVER]`、`[CAMERA][device] HELLO/STAT`；网页“摄像头：已连接 · 无画面帧”表示设备在线但未推流（多为设备端摄像头初始化失败，检查是否用 PSRAM=OPI 编译）。
+
 ## 💻 系统要求
 
 ### 硬件要求
