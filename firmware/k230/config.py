@@ -39,8 +39,11 @@ def load_secrets():
     for name in ("WIFI_SSID", "WIFI_PASSWORD", "SERVER_HOST", "SERVER_PORT"):
         if hasattr(k230_secrets, name):
             values[name] = getattr(k230_secrets, name)
-    for name in ("WIFI_SSID", "WIFI_PASSWORD", "SERVER_HOST"):
+    for name in ("WIFI_SSID", "WIFI_PASSWORD"):
         if not values.get(name):
             raise ValueError("Missing required private setting: " + name)
+    # SERVER_HOST 允许缺省/填 "auto"：启动时 UDP 广播自动发现后端（免改板子文件）。
+    if not values.get("SERVER_HOST"):
+        values["SERVER_HOST"] = "auto"
     values.setdefault("SERVER_PORT", SERVER_PORT)
     return values

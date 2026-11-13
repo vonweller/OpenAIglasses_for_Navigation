@@ -8,6 +8,7 @@ import time
 import _thread
 import network
 
+import discover
 import config
 from audio_io import AudioIO
 from camera import Camera
@@ -191,6 +192,17 @@ class Client:
                 start = time.ticks_ms()
             time.sleep_ms(100)
         log("wifi", "connected")
+        # 【自动发现】SERVER_HOST 缺省/"auto" 时广播发现后端，换电脑免改板子
+        if self.private.get("SERVER_HOST") == "auto":
+            log("discover", "broadcasting AIGLASS_DISCOVER ...")
+            host, port = discover.resolve_server(timeout_ms=5000)
+            if host is None:
+                log("discover", "server not found; will retry")
+                self.wifi_attempt = time.ticks_ms()
+                return "retry_wifi"
+            self.private["SERVER_HOST"] = host
+            self.private["SERVER_PORT"] = port
+            log("discover", "server = %s:%d" % (host, port))
         self.audio.open()
         self.mic_done = False
         _thread.start_new_thread(self.microphone_worker, ())
@@ -318,13 +330,22 @@ class Client:
 
 
 def main(duration=0):
+    global _client
     client = Client()
+    _client = client
     try:
-        client.run(duration or config.RUN_SECONDS)
-    except KeyboardInterrupt:
-        log("system", "interrupted")
-    except Exception as exc:
-        sys.print_exception(exc)
+        while True:
+            try:
+                result = client.run(duration or config.RUN_SECONDS)
+                if result != "retry_wifi":
+                    break
+                time.sleep_ms(2000)   # 发现失败，稍后重新广播
+            except KeyboardInterrupt:
+                log("system", "interrupted")
+                break
+            except Exception as exc:
+                sys.print_exception(exc)
+                time.sleep_ms(2000)
     finally:
         client.close()
 
