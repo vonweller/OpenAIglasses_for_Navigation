@@ -1345,7 +1345,10 @@ void loop() {
     wifi_retry_ms = 1000;
     cam_next_retry_at = now;
     aud_next_retry_at = now;
-    Serial.println("[WiFi] connected " + WiFi.localIP().toString());
+    // 【perf】部分路由器/DHCP 续约会重新打开 modem sleep；每次连上后强制关闭
+    WiFi.setSleep(false);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    Serial.println("[WiFi] connected " + WiFi.localIP().toString() + " (PS off)");
   }
 
   // 两路 WebSocket 使用独立计时器；一路失败不会阻塞另一路轮询。
